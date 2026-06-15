@@ -29,6 +29,7 @@ def track_head_height(
   return torch.exp(-scale * shortfall * shortfall)
 
 
+# 鼓励“头部”以目标速度向上运动；而当头部高度达到一定阈值后，停止施加这个速度要求
 def upward_velocity(
   env: ManagerBasedRlEnv,
   target_velocity: float = 0.25,

@@ -8,6 +8,9 @@ from mjlab.envs import ManagerBasedRlEnv
 __all__ = ["smp_too_low", "stood_up"]
 
 
+# 判断机器人是否已经成功站立，并且要求这种站立是“稳定”的（达到一定高度、速度极小，且能保持足够长的时间）。一旦达成，就结束当前回合
+# 通过将成功标记为 Truncation（在大多数框架中通过传 time_out=True 或类似的 flag 实现），
+# RL 算法的 Critic 网络会进行自举。它会告诉 AI：“回合虽然结束了，但如果你继续保持这个站立姿势，未来还能拿到源源不断的奖励（$V(s_{t+1})$）”
 def stood_up(
   env: ManagerBasedRlEnv,
   head_height: float = 1.2,
@@ -31,6 +34,7 @@ def stood_up(
   return cnt >= hold_steps
 
 
+# 脱离了合理的运动空间，就立即强制结束当前的训练回合
 def smp_too_low(
   env: ManagerBasedRlEnv,
   threshold: float = 0.02,
