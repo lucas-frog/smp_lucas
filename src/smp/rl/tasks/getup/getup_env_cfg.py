@@ -16,7 +16,7 @@ from smp.rl.tasks.getup import mdp
 # Matches the existing ``head_collision`` geom on ``torso_link`` in g1.xml.
 HEAD_POS_IN_TORSO: tuple[float, float, float] = (0.0, 0.0, 0.43)
 
-
+# 添加一个无质量的头部参考点
 def get_g1_spec_with_head() -> mujoco.MjSpec:  # type: ignore[attr-defined]
   """Stock G1 spec with a massless ``head`` site on ``torso_link``."""
   spec = _get_g1_spec()
@@ -35,7 +35,7 @@ def g1_getup_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
   # --- Events --------------------------------------------------------------
   cfg.events["init_smp_state"].params["ckpt_path"] = (
-    "datasets/pretrain_ckpt/pretrained_getup_f2s2.pt"
+    "logs/pretrain/pretrain/20260614_142121/pretrained.pt"
   )
   cfg.events["reset_stand_counter"] = EventTermCfg(
     func=mdp.reset_stand_counter, mode="reset"

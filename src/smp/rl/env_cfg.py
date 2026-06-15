@@ -16,6 +16,7 @@ from mjlab.envs.mdp import dr, time_out
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.action_manager import ActionTermCfg
 from mjlab.managers.command_manager import CommandTermCfg
+from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.observation_manager import ObservationGroupCfg, ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
@@ -42,11 +43,11 @@ def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
   # --- Observations --------------------------------------------------------
   actor_terms = {
-    "base_lin_vel": ObservationTermCfg(
-      func=mdp.builtin_sensor,
-      params={"sensor_name": "robot/imu_lin_vel"},
-      noise=Unoise(n_min=-0.5, n_max=0.5),
-    ),
+    # "base_lin_vel": ObservationTermCfg(
+    #   func=mdp.builtin_sensor,
+    #   params={"sensor_name": "robot/imu_lin_vel"},
+    #   noise=Unoise(n_min=-0.5, n_max=0.5),
+    # ),
     "base_ang_vel": ObservationTermCfg(
       func=mdp.builtin_sensor,
       params={"sensor_name": "robot/imu_ang_vel"},
@@ -69,6 +70,11 @@ def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
   critic_terms = {
     **actor_terms,
+    "base_lin_vel": ObservationTermCfg(
+      func=mdp.builtin_sensor,
+      params={"sensor_name": "robot/imu_lin_vel"},
+      noise=Unoise(n_min=-0.5, n_max=0.5),
+    ),
   }
 
   observations = {
@@ -98,6 +104,9 @@ def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # --- Commands ------------------------------------------------------------
   commands: dict[str, CommandTermCfg] = {}
 
+  # --- Curriculum ------------------------------------------------------------
+  curriculum: dict[str, CurriculumTermCfg] = {}  
+
   # --- Events --------------------------------------------------------------
   events = {
     "init_smp_state": EventTermCfg(
@@ -120,10 +129,10 @@ def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     "push_robot": EventTermCfg(
       func=mdp.push_by_setting_velocity,
       mode="interval",
-      interval_range_s=(1.0, 3.0),
+      interval_range_s=(5.0, 6.0),
       params={
         "velocity_range": {
-          "x": (-0.5, 0.5),
+          "x": (-0.8, 0.8),
           "y": (-0.5, 0.5),
           "z": (-0.4, 0.4),
           "roll": (-0.52, 0.52),
@@ -140,7 +149,7 @@ def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
           "robot", geom_names=r"^(left|right)_foot[1-7]_collision$"
         ),
         "operation": "abs",
-        "ranges": (0.3, 1.2),
+        "ranges": (0.3, 1.6),
         "shared_random": True,  # All foot geoms share the same friction.
       },
     ),
@@ -159,9 +168,9 @@ def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         "asset_cfg": SceneEntityCfg("robot", body_names="torso_link"),
         "operation": "add",
         "ranges": {
-          0: (-0.025, 0.025),
-          1: (-0.025, 0.025),
-          2: (-0.03, 0.03),
+          0: (-0.05, 0.05),
+          1: (-0.05, 0.05),
+          2: (-0.05, 0.05),
         },
       },
     ),
