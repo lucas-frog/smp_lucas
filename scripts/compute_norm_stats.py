@@ -16,6 +16,8 @@ from pathlib import Path
 import numpy as np
 import tyro
 
+from smp.motion.normalization import fit_quantile_bounds
+
 
 @dataclass
 class Cfg:
@@ -46,17 +48,7 @@ def main(cfg: Cfg) -> None:
   all_frames = np.concatenate(chunks, axis=0).astype(np.float64)
   print(f"\nTotal frames: {all_frames.shape[0]}, feature dim: {all_frames.shape[1]}")
 
-  q_low = np.percentile(all_frames, cfg.q_low * 100, axis=0).astype(np.float32)
-  q_high = np.percentile(all_frames, cfg.q_high * 100, axis=0).astype(np.float32)
-
-  # Prevent zero-range (constant features) → set a minimum span.
-  span = q_high - q_low
-  tiny = span < 1e-6
-  if tiny.any():
-    print(
-      f"  WARNING: {tiny.sum()} features have near-zero range, using fallback span=1.0"
-    )
-    q_high[tiny] = q_low[tiny] + 1.0
+  q_low, q_high = fit_quantile_bounds(all_frames, q_low=cfg.q_low, q_high=cfg.q_high)
 
   out_path = Path(cfg.output)
   out_path.parent.mkdir(parents=True, exist_ok=True)

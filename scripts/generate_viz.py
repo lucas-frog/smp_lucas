@@ -24,6 +24,7 @@ import viser
 from mjlab.entity import Entity
 from mjlab.viewer.viser.scene import MjlabViserScene
 
+from smp.motion.normalization import denormalize_quantiles
 from smp.pretrain.model import DiffusionDenoiser
 from smp.pretrain.scheduler import DDPMScheduler
 from smp.sampling.feature_to_state import (
@@ -115,7 +116,7 @@ def _setup_g1_sim(device: str):
 def _quantile_denormalize(
   x: torch.Tensor, q_low: torch.Tensor, q_high: torch.Tensor
 ) -> torch.Tensor:
-  return (x + 1.0) / 2.0 * (q_high - q_low) + q_low
+  return denormalize_quantiles(x, q_low, q_high)
 
 
 @torch.no_grad()

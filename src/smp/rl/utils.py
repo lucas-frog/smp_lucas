@@ -2,20 +2,68 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import numpy as np
 import torch
-from mjlab.utils.lab_api.math import (
-  matrix_from_quat,
-  quat_apply_inverse,
-  quat_conjugate,
-  quat_mul,
-  yaw_quat,
-)
 
+from smp.motion.features import compute_motion_features
 from smp.pretrain.model import DiffusionDenoiser
 from smp.pretrain.scheduler import DDPMScheduler
+
+
+def _remap_tinymdm_to_denoiser(state_dict: dict[str, Any]) -> dict[str, Any]:
+  """Remap ``TinyStableMotionDiTModel`` / ``CondTinyStableMotionDiTModel``
+  state-dict keys to ``DiffusionDenoiser`` keys so training checkpoints
+  from ``unitree_rl_mjlab`` can be loaded directly."""
+  remapped: dict[str, Any] = {}
+  for key, value in state_dict.items():
+    # ── optional prefix (dmodel., ema_model., etc.) ──
+    new_key = key
+    # Strip known outer prefixes — they are re-added by the caller
+    for prefix in ("dmodel.", "ema_model.", "model."):
+      if new_key.startswith(prefix):
+        new_key = new_key[len(prefix):]
+        break
+
+    # transformer_blocks.N.attn1.  →  blocks.N.
+    new_key = re.sub(
+      r"^transformer_blocks\.(\d+)\.attn1\.", r"blocks.\1.", new_key
+    )
+    # transformer_blocks.N. (non-attn keys like ff, scale_shift_table) → blocks.N.
+    new_key = re.sub(
+      r"^transformer_blocks\.(\d+)\.", r"blocks.\1.", new_key
+    )
+
+    # ff.net.0.proj  →  ff.act.proj
+    new_key = new_key.replace("ff.net.0.proj", "ff.act.proj")
+    # ff.net.2  →  ff.proj_out
+    new_key = new_key.replace("ff.net.2", "ff.proj_out")
+
+    # adaln_single.emb.  →  adaln_single.  (drop ".emb" sub-module)
+    new_key = new_key.replace("adaln_single.emb.", "adaln_single.")
+
+    # to_out.0.bias — DiffusionDenoiser uses bias=False → skip
+    if "to_out.0.bias" in new_key:
+      continue
+    # to_out.0.weight  →  to_out.weight
+    new_key = new_key.replace("to_out.0.", "to_out.")
+
+    # Top-level scale_shift_table (unused in forward) → skip
+    if new_key == "scale_shift_table":
+      continue
+
+    remapped[new_key] = value
+  return remapped
+
+
+def _is_tinymdm_checkpoint(ckpt: dict[str, Any]) -> bool:
+  """Heuristic: training checkpoints have flat ``dmodel.*`` keys and no ``cfg``."""
+  return (
+    "cfg" not in ckpt
+    and any(k.startswith("dmodel.") for k in ckpt)
+  )
 
 
 def load_denoiser(
@@ -23,11 +71,70 @@ def load_denoiser(
   device: torch.device | str,
 ) -> tuple[DiffusionDenoiser, DDPMScheduler, torch.Tensor, torch.Tensor, int, int]:
   """Load a frozen pretrained denoiser checkpoint → ``(model, scheduler, q_low,
-  q_high, feature_dim, window_size)``."""
+  q_high, feature_dim, window_size)``.
+
+  Accepts two checkpoint formats:
+
+  * **SMP native** — ``{"model": state, "model_ema": state, "cfg": {...},
+    "q_low": ndarray, "q_high": ndarray}``
+  * **TinyMDM training** — flat ``dmodel.*`` / ``ema_dmodel.*`` keys,
+    ``_smp_q_low`` / ``_smp_q_high``, no ``cfg``.  Module names are remapped
+    to the ``DiffusionDenoiser`` layout.
+  """
   device = torch.device(device)
 
   ckpt: dict[str, Any] = torch.load(ckpt_path, map_location=device, weights_only=False)
-  cfg = ckpt["cfg"]
+
+  # ── detect TinyMDM training format ──
+  if _is_tinymdm_checkpoint(ckpt):
+    # --- cfg from heuristics + known config defaults ---
+    pe = ckpt["dmodel.sequence_pos_encoder.pe"]
+    window_size = int(pe.shape[1])
+    d_model = int(pe.shape[2])
+    feature_dim = int(ckpt["dmodel.preprocess_conv.weight"].shape[0])
+    num_layers = sum(
+      1
+      for k in ckpt
+      if k.startswith("dmodel.transformer_blocks.")
+      and ".attn1.to_q.weight" in k
+    )
+
+    cfg: dict[str, Any] = {
+      "feature_dim": feature_dim,
+      "window_size": window_size,
+      "d_model": d_model,
+      "nhead": 4,
+      "num_layers": num_layers,
+      "dropout": 0.05,
+      "num_timesteps": 50,
+    }
+
+    # --- model weights ---
+    raw_model = {k: v for k, v in ckpt.items() if not k.startswith("ema_dmodel.")}
+    state = _remap_tinymdm_to_denoiser(raw_model)
+
+    # --- EMA weights (preferred) ---
+    ema_raw = {
+      k: v
+      for k, v in ckpt.items()
+      if k.startswith("ema_dmodel.ema_model.") or k.startswith("ema_dmodel.model.")
+    }
+    if ema_raw:
+      state = _remap_tinymdm_to_denoiser(ema_raw)
+
+    # --- quantile bounds ---
+    q_low = ckpt.get("_smp_q_low", ckpt.get("q_low"))
+    q_high = ckpt.get("_smp_q_high", ckpt.get("q_high"))
+  else:
+    cfg = ckpt["cfg"]
+    state = ckpt.get("model_ema") or ckpt["model"]
+    # Remap if the native-format checkpoint still has TinyMDM key names
+    # (can happen when a training checkpoint was partially converted).
+    if any("transformer_blocks." in k or "adaln_single.emb." in k for k in state):
+      state = _remap_tinymdm_to_denoiser(state)
+    q_low = ckpt["q_low"]
+    q_high = ckpt["q_high"]
+
   feature_dim = int(cfg["feature_dim"])
   window_size = int(cfg["window_size"])
 
@@ -39,8 +146,7 @@ def load_denoiser(
     num_layers=int(cfg.get("num_layers", 2)),
     dropout=float(cfg.get("dropout", 0.0)),
   ).to(device)
-  state = ckpt.get("model_ema") or ckpt["model"]
-  model.load_state_dict(state)
+  model.load_state_dict(state, strict=False)
   model.eval()
   model.requires_grad_(False)
 
@@ -48,8 +154,8 @@ def load_denoiser(
     num_timesteps=int(cfg.get("num_timesteps", 50)),
   ).to(device)
 
-  q_low = torch.from_numpy(np.asarray(ckpt["q_low"], dtype=np.float32)).to(device)
-  q_high = torch.from_numpy(np.asarray(ckpt["q_high"], dtype=np.float32)).to(device)
+  q_low = torch.from_numpy(np.asarray(q_low, dtype=np.float32)).to(device)
+  q_high = torch.from_numpy(np.asarray(q_high, dtype=np.float32)).to(device)
 
   return model, scheduler, q_low, q_high, feature_dim, window_size
 
@@ -172,57 +278,12 @@ class MotionFeatureBuffer:
     self.joint_vel[:, -1] = joint_vel
 
   def compute_features(self) -> torch.Tensor:
-    """Return features ``(num_envs, W, 3+6+J+E*3+3+3)``, all anchored to the LAST
-    frame's yaw-only local frame (layout in the class docstring)."""
-    N = self.num_envs
-    W = self.window_size
-    E = self.num_ee
-
-    anchor_pos_T = self.root_pos_w[:, -1]
-    anchor_quat_T = self.root_quat_w[:, -1]
-    yaw_T = yaw_quat(anchor_quat_T)
-    heading_inv_T = quat_conjugate(yaw_T)
-    heading_inv_T_W = heading_inv_T[:, None, :].expand(N, W, 4)
-    yaw_T_W = yaw_T[:, None, :].expand(N, W, 4).reshape(-1, 4)
-
-    root_offset = self.root_pos_w - anchor_pos_T[:, None, :]
-    root_pos_local = quat_apply_inverse(yaw_T_W, root_offset.reshape(-1, 3)).reshape(
-      N, W, 3
-    )
-    root_pos_local = root_pos_local.clone()
-    root_pos_local[..., 2] = self.root_pos_w[..., 2]
-
-    # 6D rot is stacked [col0, col2] = [rotated-x-axis, rotated-z-axis].
-    root_rot_local_quat = quat_mul(
-      heading_inv_T_W.reshape(-1, 4),
-      self.root_quat_w.reshape(-1, 4),
-    ).reshape(N, W, 4)
-    root_rot_mat = matrix_from_quat(root_rot_local_quat.reshape(-1, 4)).reshape(
-      N, W, 3, 3
-    )
-    root_rot_6d = torch.cat([root_rot_mat[..., :, 0], root_rot_mat[..., :, 2]], dim=-1)
-
-    ee_offset_w = self.ee_pos_w - self.root_pos_w[:, :, None, :]
-    yaw_T_E = yaw_T[:, None, None, :].expand(N, W, E, 4).reshape(-1, 4)
-    ee_pos_local = quat_apply_inverse(yaw_T_E, ee_offset_w.reshape(-1, 3)).reshape(
-      N, W, E * 3
-    )
-
-    lin_vel_local = quat_apply_inverse(
-      yaw_T_W, self.root_lin_vel_w.reshape(-1, 3)
-    ).reshape(N, W, 3)
-    ang_vel_local = quat_apply_inverse(
-      yaw_T_W, self.root_ang_vel_w.reshape(-1, 3)
-    ).reshape(N, W, 3)
-
-    return torch.cat(
-      [
-        root_pos_local,
-        root_rot_6d,
-        self.joint_pos,
-        ee_pos_local,
-        lin_vel_local,
-        ang_vel_local,
-      ],
-      dim=-1,
+    """Return features ``(num_envs, W, FEATURE_DIM)`` in the shared SMP layout."""
+    return compute_motion_features(
+      root_pos=self.root_pos_w,
+      root_quat=self.root_quat_w,
+      root_lin_vel=self.root_lin_vel_w,
+      root_ang_vel=self.root_ang_vel_w,
+      ee_pos=self.ee_pos_w,
+      joint_pos=self.joint_pos,
     )

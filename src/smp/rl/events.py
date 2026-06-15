@@ -8,10 +8,13 @@ env-origin-relative frame, so the SMP reward is invariant to env placement.
 
 from __future__ import annotations
 
+import warnings
+
 import torch
 from mjlab.envs import ManagerBasedRlEnv
-from mjlab.utils.lab_api.math import quat_apply, quat_mul, yaw_quat
 
+from smp.motion.math import quat_apply, quat_mul, yaw_quat
+from smp.motion.normalization import denormalize_quantiles
 from smp.rl.utils import DiffNormalizer, MotionFeatureBuffer, load_denoiser
 from smp.sampling.feature_to_state import (
   EE_BODY_NAMES,
@@ -23,9 +26,52 @@ from smp.sampling.feature_to_state import (
 NUM_JOINTS = 29
 
 
+def _is_compile_backend_error(exc: Exception) -> bool:
+  try:
+    from torch._dynamo.exc import BackendCompilerFailed
+
+    if isinstance(exc, BackendCompilerFailed):
+      return True
+  except ImportError:
+    pass
+  try:
+    from torch._inductor.exc import InductorError
+
+    if isinstance(exc, InductorError):
+      return True
+  except ImportError:
+    pass
+  return "NoValidChoicesError" in str(exc)
+
+
+class _CompiledModelWithFallback(torch.nn.Module):
+  def __init__(self, eager_model: torch.nn.Module, compiled_model: torch.nn.Module):
+    super().__init__()
+    self.eager_model = eager_model
+    self.compiled_model = compiled_model
+
+  def forward(self, *args, **kwargs):
+    if self.compiled_model is None:
+      return self.eager_model(*args, **kwargs)
+    try:
+      return self.compiled_model(*args, **kwargs)
+    except Exception as exc:
+      if not _is_compile_backend_error(exc):
+        raise
+      self.compiled_model = None
+      first_line = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+      warnings.warn(
+        "torch.compile failed for the SMP denoiser; falling back to eager "
+        f"execution for later calls. First error: {first_line}",
+        RuntimeWarning,
+        stacklevel=2,
+      )
+      return self.eager_model(*args, **kwargs)
+
+
 def _maybe_compile(model, compile_model: bool, compile_mode: str | None):
   """``torch.compile`` ``model`` (no-op if ``compile_model`` false), working
-  around the Inductor ``pad_mm`` TF32 crash by disabling shape padding."""
+  around Inductor max-autotune edge cases for this small denoiser."""
   if not compile_model:
     return model
   torch.set_float32_matmul_precision("high")
@@ -33,11 +79,21 @@ def _maybe_compile(model, compile_model: bool, compile_mode: str | None):
     import torch._inductor.config as _ic
 
     _ic.shape_padding = False
+    if compile_mode is not None and compile_mode.startswith("max-autotune"):
+      gemm_backends = [
+        backend.strip()
+        for backend in str(_ic.max_autotune_gemm_backends).split(",")
+        if backend.strip()
+      ]
+      if not any(backend.upper() == "ATEN" for backend in gemm_backends):
+        _ic.max_autotune_gemm_backends = ",".join(["ATEN", *gemm_backends])
   except ImportError:
     pass
   if compile_mode is not None:
-    return torch.compile(model, fullgraph=True, mode=compile_mode)
-  return torch.compile(model, fullgraph=True)
+    compiled_model = torch.compile(model, fullgraph=True, mode=compile_mode)
+  else:
+    compiled_model = torch.compile(model, fullgraph=True)
+  return _CompiledModelWithFallback(model, compiled_model)
 
 
 def init_smp_state(
@@ -196,7 +252,7 @@ def _ddpm_sample(env: ManagerBasedRlEnv, n: int) -> torch.Tensor:
     t = torch.full((n,), t_int, dtype=torch.long, device=env.device)
     eps = model(x_t, t)
     x_t = scheduler.step(eps, x_t, t_int)
-  return (x_t + 1.0) / 2.0 * (q_high - q_low) + q_low
+  return denormalize_quantiles(x_t, q_low, q_high)
 
 
 @torch.no_grad()

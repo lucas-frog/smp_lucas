@@ -9,8 +9,8 @@ pelvis_T, heading = yaw_T).
 from __future__ import annotations
 
 import torch
-from mjlab.utils.lab_api.math import (
-  matrix_from_quat,
+
+from smp.motion.math import (
   quat_apply,
   quat_conjugate,
   quat_from_matrix,
@@ -158,18 +158,6 @@ def window_to_ee_trajectories(
 
   ee_offset_w = quat_apply(yaw_T_E, ee_pos_local.reshape(-1, 3)).reshape(W, E, 3)
   return ee_offset_w + pelvis_pos_w[:, None, :]
-
-
-def tan_norm_from_quat(quat: torch.Tensor) -> torch.Tensor:
-  """Convert quaternion (wxyz) to 6D tan-norm.
-
-  Stacks the rotation matrix's first column (rotated x-axis) and third
-  column (rotated z-axis).
-  """
-  mat = matrix_from_quat(quat)
-  col0 = mat[..., :, 0]
-  col2 = mat[..., :, 2]
-  return torch.cat([col0, col2], dim=-1)
 
 
 def heading_inv_quat(quat: torch.Tensor) -> torch.Tensor:

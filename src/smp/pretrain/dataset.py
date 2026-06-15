@@ -8,6 +8,12 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from smp.motion.normalization import (
+  denormalize_quantiles,
+  fit_quantile_bounds,
+  normalize_quantiles,
+)
+
 
 class MotionWindowDataset(Dataset[torch.Tensor]):
   """Loads pre-windowed NPZs produced by scripts/csv_to_npz.py.
@@ -58,22 +64,17 @@ class MotionWindowDataset(Dataset[torch.Tensor]):
     else:
       # Fallback: compute from data directly.
       flat = data.reshape(-1, self.feature_dim)
-      self.q_low = np.percentile(flat, 1, axis=0).astype(np.float32)
-      self.q_high = np.percentile(flat, 99, axis=0).astype(np.float32)
-      span = self.q_high - self.q_low
-      tiny = span < 1e-6
-      if tiny.any():
-        self.q_high[tiny] = self.q_low[tiny] + 1.0
+      self.q_low, self.q_high = fit_quantile_bounds(flat)
 
     # Normalize
-    data = 2.0 * (data - self.q_low) / (self.q_high - self.q_low) - 1.0
+    data = normalize_quantiles(data, self.q_low, self.q_high)
 
     self.windows = torch.from_numpy(data)
 
   def denormalize(self, x: torch.Tensor) -> torch.Tensor:
     q_low = torch.from_numpy(self.q_low).to(x.device, x.dtype)
     q_high = torch.from_numpy(self.q_high).to(x.device, x.dtype)
-    return (x + 1.0) / 2.0 * (q_high - q_low) + q_low
+    return denormalize_quantiles(x, q_low, q_high)
 
   def __len__(self) -> int:
     return self.windows.shape[0]
