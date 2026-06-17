@@ -9,9 +9,11 @@ env-origin-relative frame, so the SMP reward is invariant to env placement.
 from __future__ import annotations
 
 import warnings
+from typing import Callable
 
 import torch
 from mjlab.envs import ManagerBasedRlEnv
+from mjlab.managers.action_manager import ActionTerm
 
 from smp.motion.math import quat_apply, quat_mul, yaw_quat
 from smp.motion.normalization import denormalize_quantiles
@@ -302,3 +304,104 @@ def gsi_reset(env: ManagerBasedRlEnv, env_ids: torch.Tensor | None = None) -> No
   idx = torch.randint(0, pool.shape[0], (n,), device=env.device)
   window = pool[idx]
   _prime_sim_and_buffer(env, env_ids, window)
+
+
+# ---------------------------------------------------------------------------
+# Action delay (control delay randomization)
+# ---------------------------------------------------------------------------
+# Mirrors GR00T-VisualSim2Real's domain_rand.randomize_ctrl_delay mechanism:
+# each environment gets an independent random action delay (in control steps)
+# that is re-sampled on every episode reset.  The delay is injected by wrapping
+# each action term's ``process_actions`` so it pushes the network output into a
+# per-env FIFO queue and replaces ``_processed_actions`` with a delayed frame
+# *before* ``apply_actions`` writes it to the simulation.
+# ---------------------------------------------------------------------------
+
+
+def _install_action_delay(
+  env: ManagerBasedRlEnv,
+  original_process: Callable[[torch.Tensor], None],
+  term_name: str,
+) -> Callable[[torch.Tensor], None]:
+  """Return a wrapped ``process_actions`` that applies per-env action delay.
+
+  The wrapper reads ``env._ad_queue``, ``env._ad_idx``, and
+  ``env._ad_range`` which must already be allocated by
+  :func:`init_action_delay`.
+  """
+  def delayed_process(actions: torch.Tensor) -> None:
+    original_process(actions)
+    term = env.action_manager._terms[term_name]
+    q = env._ad_queue[term_name]
+    q[:, 1:] = q[:, :-1].clone()
+    q[:, 0] = term._processed_actions.clone()
+    term._processed_actions = q[
+      torch.arange(env.num_envs, device=env.device), env._ad_idx
+    ].clone()
+
+  return delayed_process
+
+
+@torch.no_grad()
+def init_action_delay(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor | None = None,
+  delay_step_range: tuple[int, int] = (0, 2),
+) -> None:
+  """Startup-mode event: wrap every action term with per-env randomised control delay.
+
+  If ``delay_step_range`` is ``(0, 0)`` this is a no-op (no delay).
+
+  The delay is expressed in *control steps* (i.e. environment steps, not
+  physics substeps).  With the default ``(0, 2)`` each environment draws
+  ``delay ∈ {0, 1, 2}`` uniformly on startup and on every episode reset.
+  A delay of 0 means "use the action just produced"; a delay of 2 means
+  "use the action from 2 control steps ago".
+  """
+  del env_ids  # startup always applies to all envs
+  lo, hi = int(delay_step_range[0]), int(delay_step_range[1])
+  if lo == 0 and hi == 0:
+    return
+
+  terms: dict[str, ActionTerm] = env.action_manager._terms
+  env._ad_queue: dict[str, torch.Tensor] = {}
+  env._ad_idx = torch.randint(
+    lo, hi + 1, (env.num_envs,), dtype=torch.long, device=env.device
+  )
+  env._ad_range = (lo, hi)
+
+  for name, term in terms.items():
+    if not hasattr(term, "_processed_actions"):
+      continue
+    d = int(term.action_dim)
+    q = torch.zeros(
+      env.num_envs, hi + 1, d, dtype=torch.float, device=env.device
+    )
+    env._ad_queue[name] = q
+
+    original = term.process_actions
+    term.process_actions = _install_action_delay(env, original, name)
+
+
+@torch.no_grad()
+def reset_action_delay(
+  env: ManagerBasedRlEnv, env_ids: torch.Tensor | None = None
+) -> None:
+  """Reset-mode event: re-randomise delay indices and clear action queues.
+
+  Must be paired with :func:`init_action_delay` in the event config.
+  """
+  if not hasattr(env, "_ad_queue"):
+    return
+  if env_ids is None:
+    env_ids = torch.arange(env.num_envs, device=env.device)
+  n = int(env_ids.numel())
+  if n == 0:
+    return
+
+  lo, hi = env._ad_range
+  env._ad_idx[env_ids] = torch.randint(
+    lo, hi + 1, (n,), dtype=torch.long, device=env.device
+  )
+  for q in env._ad_queue.values():
+    q[env_ids] *= 0.0

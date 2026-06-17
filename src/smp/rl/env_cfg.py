@@ -33,7 +33,9 @@ from mjlab.viewer import ViewerConfig
 from smp.rl.events import (
   gsi_refresh,
   gsi_reset,
+  init_action_delay,
   init_smp_state,
+  reset_action_delay,
 )
 
 
@@ -174,6 +176,20 @@ def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         },
       },
     ),
+    # Control delay randomization (mirrors GR00T domain_rand.randomize_ctrl_delay).
+    # Each env gets an independent random action delay ∈ {0, 1, 2} control steps
+    # (0-90 ms at 30 Hz).  Re-sampled on every episode reset.
+    # Set delay_step_range=(0, 0) or remove these two terms to disable.
+    "init_action_delay": EventTermCfg(
+      mode="startup",
+      func=init_action_delay,
+      params={"delay_step_range": (0, 2)},
+    ),
+    "reset_action_delay": EventTermCfg(
+      mode="reset",
+      func=reset_action_delay,
+      params={},
+    ),
   }
 
   # --- Rewards -------------------------------------------------------------
@@ -239,6 +255,8 @@ def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg.episode_length_s = int(1e9)
     cfg.events.pop("push_robot", None)
     cfg.events.pop("gsi_refresh", None)
+    cfg.events.pop("init_action_delay", None)
+    cfg.events.pop("reset_action_delay", None)
     cfg.events["init_smp_state"].params["compile_model"] = False
     cfg.events["init_smp_state"].params["gsi_buffer_size"] = 1024
 
