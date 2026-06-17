@@ -54,40 +54,40 @@ def g1_velocity_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   #   Set to 0 to use uniform from the start (skip directional phase).
   # steps_per_iteration: must match num_steps_per_env in rl_cfg.py (currently 24).
   ##
-  cfg.commands["twist"] = mdp.PhasedVelocityCommandCfg(
-    directional_cfg=mdp.DirectionalVelocityCommandCfg(
-      entity_name="robot",
-      rel_forward=0.35,
-      rel_backward=0.35,
-      rel_left=0.10,
-      rel_right=0.10,
-      rel_standing=0.10,
-      rel_ang_overlay=0.40,
-      forward_speed=(0.5, 4.0),
-      backward_speed=(0.5, 2.0),
-      lateral_speed=(0.3, 0.8),
-      ang_speed=(0.3, 0.6),
-      debug_vis=False,  # wrapper handles debug_vis
-    ),
-    uniform_cfg=mdp.UniformVelocityCommandCfg(
-      entity_name="robot",
-      resampling_time_range=(4.0, 8.0),
-      rel_standing_envs=0.1,
-      rel_heading_envs=0.0,
-      rel_forward_envs=0.0,
-      heading_command=False,
-      heading_control_stiffness=0.5,
-      debug_vis=False,  # wrapper handles debug_vis
-      ranges=mdp.UniformVelocityCommandCfg.Ranges(
-        lin_vel_x=(-2.0, 4.0),
-        lin_vel_y=(-1.0, 1.0),
-        ang_vel_z=(-0.8, 0.8),
-      ),
-    ),
-    phase_switch_iteration=5000,
-    steps_per_iteration=24,
-    debug_vis=True,
-  )
+  # cfg.commands["twist"] = mdp.PhasedVelocityCommandCfg(
+  #   directional_cfg=mdp.DirectionalVelocityCommandCfg(
+  #     entity_name="robot",
+  #     rel_forward=0.35,
+  #     rel_backward=0.35,
+  #     rel_left=0.10,
+  #     rel_right=0.10,
+  #     rel_standing=0.10,
+  #     rel_ang_overlay=0.40,
+  #     forward_speed=(0.5, 4.0),
+  #     backward_speed=(0.5, 2.0),
+  #     lateral_speed=(0.3, 0.8),
+  #     ang_speed=(0.3, 0.6),
+  #     debug_vis=False,  # wrapper handles debug_vis
+  #   ),
+  #   uniform_cfg=mdp.UniformVelocityCommandCfg(
+  #     entity_name="robot",
+  #     resampling_time_range=(4.0, 8.0),
+  #     rel_standing_envs=0.1,
+  #     rel_heading_envs=0.0,
+  #     rel_forward_envs=0.0,
+  #     heading_command=False,
+  #     heading_control_stiffness=0.5,
+  #     debug_vis=False,  # wrapper handles debug_vis
+  #     ranges=mdp.UniformVelocityCommandCfg.Ranges(
+  #       lin_vel_x=(-2.0, 4.0),
+  #       lin_vel_y=(-1.0, 1.0),
+  #       ang_vel_z=(-0.8, 0.8),
+  #     ),
+  #   ),
+  #   phase_switch_iteration=5000,
+  #   steps_per_iteration=24,
+  #   debug_vis=True,
+  # )
 
   # --- Legacy single-command configs (kept for reference) ------------------
   #
@@ -123,11 +123,45 @@ def g1_velocity_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   #   heading_control_stiffness=0.5,
   #   debug_vis=True,
   #   ranges=mdp.UniformVelocityCommandCfg.Ranges(
-  #     lin_vel_x=(-1.0, 4.0),
-  #     lin_vel_y=(-1.5, 1.5),
+  #     lin_vel_x=(-2.0, 4.0),
+  #     lin_vel_y=(-1.0, 1.0),
   #     ang_vel_z=(-0.8, 0.8),
   #   ),
   # )
+  #
+  # Mixed (spatial split): directional_fraction of envs run directional,
+  # the rest run uniform — both command types operate simultaneously.
+  cfg.commands["twist"] = mdp.MixedVelocityCommandCfg(
+    directional_cfg=mdp.DirectionalVelocityCommandCfg(
+      entity_name="robot",
+      rel_forward=0.7, rel_backward=0.3,
+      rel_left=0.0, rel_right=0.0,
+      rel_standing=0.0,
+      rel_ang_overlay=0.40,
+      forward_speed=(0.5, 4.0),
+      backward_speed=(0.5, 1.5),
+      lateral_speed=(0.3, 0.8),
+      ang_speed=(0.3, 0.8),
+      debug_vis=False,
+    ),
+    uniform_cfg=mdp.UniformVelocityCommandCfg(
+      entity_name="robot",
+      resampling_time_range=(3.0, 8.0),
+      rel_standing_envs=0.1,
+      rel_heading_envs=0.0,
+      rel_forward_envs=0.0,
+      heading_command=False,
+      heading_control_stiffness=0.5,
+      debug_vis=False,
+      ranges=mdp.UniformVelocityCommandCfg.Ranges(
+        lin_vel_x=(-1.5, 4.0),
+        lin_vel_y=(-1.0, 1.0),
+        ang_vel_z=(-0.8, 0.8),
+      ),
+    ),
+    directional_fraction=0.5,  # 30% directional + 70% uniform
+    debug_vis=True,
+  )
 
   # --- Observations --------------------------------------------------------
   command_obs = ObservationTermCfg(
@@ -155,7 +189,7 @@ def g1_velocity_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         (
             mdp.track_linear_velocity,
             1.0,
-            {"command_name": "twist", "std": math.sqrt(2), "reverse_penalty": True},
+            {"command_name": "twist", "std": math.sqrt(1), "reverse_penalty": True},
         ),
         # (
         #   mdp.track_linear_velocity_world,
@@ -165,7 +199,7 @@ def g1_velocity_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         (
             mdp.track_angular_velocity,
             0.5,
-            {"command_name": "twist", "std": math.sqrt(2)},
+            {"command_name": "twist", "std": math.sqrt(1)},
         ),
         (
             mdp.action_rate_l2,

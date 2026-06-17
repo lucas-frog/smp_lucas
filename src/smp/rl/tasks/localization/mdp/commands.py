@@ -1009,3 +1009,237 @@ class PhasedVelocityCommandCfg(CommandTermCfg):
 
   def build(self, env: ManagerBasedRlEnv) -> PhasedVelocityCommand:
     return PhasedVelocityCommand(self, env)
+
+
+# ── Mixed velocity command ──────────────────────────────────────────────────
+
+
+class MixedVelocityCommand(CommandTerm):
+  """Mixed velocity command: a fraction of envs run directional, the rest uniform.
+
+  A static per-env mask (sampled once at init) assigns each environment to
+  either ``DirectionalVelocityCommand`` or ``UniformVelocityCommand``.  Both
+  delegates run in parallel every step, and the wrapper blends their outputs,
+  so directional envs learn fixed-category gaits while uniform envs
+  simultaneously generalise to the full velocity space.
+
+  ``directional_fraction`` controls the split: 0.0 = all uniform,
+  1.0 = all directional, 0.3 = 30 % directional + 70 % uniform.
+
+  Joystick (GUI) control is handled by the wrapper and overrides both
+  delegates' command tensors uniformly.
+  """
+
+  cfg: "MixedVelocityCommandCfg"
+
+  def __init__(self, cfg: "MixedVelocityCommandCfg", env: ManagerBasedRlEnv):
+    super().__init__(cfg, env)
+
+    # Build both delegates.
+    self._directional: DirectionalVelocityCommand = cfg.directional_cfg.build(env)
+    self._uniform: UniformVelocityCommand = cfg.uniform_cfg.build(env)
+
+    # Shared robot Entity (both delegates reference the same one).
+    self.robot: Entity = env.scene[cfg.directional_cfg.entity_name]
+
+    # Static per-env assignment: True → directional, False → uniform.
+    r = torch.rand(self.num_envs, device=self.device)
+    self._is_directional = r < cfg.directional_fraction
+
+    # GUI state (wrapper-owned; delegate GUIs are suppressed).
+    self._joystick_enabled: "viser.GuiCheckboxHandle | None" = None
+    self._joystick_sliders: list["viser.GuiSliderHandle"] = []
+    self._joystick_get_env_idx: Callable[[], int] | None = None
+
+  # ── Public interface ───────────────────────────────────────────────────
+
+  @property
+  def command(self) -> torch.Tensor:
+    """Body-frame velocity command blended from both delegates."""
+    cmd = self._uniform.command.clone()
+    d_mask = self._is_directional
+    cmd[d_mask] = self._directional.command[d_mask]
+    return cmd
+
+  @property
+  def is_standing_env(self) -> torch.Tensor:
+    """Boolean mask blended from both delegates."""
+    standing = self._uniform.is_standing_env.clone()
+    d_mask = self._is_directional
+    standing[d_mask] = self._directional.is_standing_env[d_mask]
+    return standing
+
+  # ── Core lifecycle ─────────────────────────────────────────────────────
+
+  def compute(self, dt: float) -> None:
+    """Step both delegates, then apply wrapper joystick override."""
+    self._directional.compute(dt)
+    self._uniform.compute(dt)
+
+    if self._joystick_enabled is not None and self._joystick_enabled.value:
+      assert self._joystick_get_env_idx is not None
+      idx = self._joystick_get_env_idx()
+      for i, slider in enumerate(self._joystick_sliders):
+        self._directional.command[idx, i] = slider.value
+        self._uniform.command[idx, i] = slider.value
+
+  def reset(self, env_ids: torch.Tensor) -> dict[str, float]:
+    """Resample each delegate for its assigned envs, return prefixed metrics."""
+    d_ids = env_ids[self._is_directional[env_ids]]
+    u_ids = env_ids[~self._is_directional[env_ids]]
+
+    extras: dict[str, float] = {}
+
+    if len(d_ids) > 0:
+      d_extras = self._directional.reset(d_ids)
+      for k, v in d_extras.items():
+        extras[f"dir_{k}"] = v
+
+    if len(u_ids) > 0:
+      u_extras = self._uniform.reset(u_ids)
+      for k, v in u_extras.items():
+        extras[f"uni_{k}"] = v
+
+    return extras
+
+  # ── Abstract method stubs (never called; delegates handle their own) ───
+
+  def _update_metrics(self) -> None:
+    pass
+
+  def _resample_command(self, env_ids: torch.Tensor) -> None:
+    pass
+
+  def _update_command(self) -> None:
+    pass
+
+  # ── Debug visualization ────────────────────────────────────────────────
+
+  def _debug_vis_impl(self, visualizer: "DebugVisualizer") -> None:
+    """Draw arrows for the blended command (single arrow set per robot)."""
+    env_indices = visualizer.get_env_indices(self.num_envs)
+    if not env_indices:
+      return
+
+    cmds = self.command.cpu().numpy()
+    base_pos_ws = self.robot.data.root_link_pos_w.cpu().numpy()
+    base_mat_ws = matrix_from_quat(self.robot.data.root_link_quat_w).cpu().numpy()
+    lin_vel_bs = self.robot.data.root_link_lin_vel_b.cpu().numpy()
+    ang_vel_bs = self.robot.data.root_link_ang_vel_b.cpu().numpy()
+    scale = self.cfg.viz.scale
+    z_offset = self.cfg.viz.z_offset
+
+    for batch in env_indices:
+      base_pos_w = base_pos_ws[batch]
+      base_mat_w = base_mat_ws[batch]
+      cmd = cmds[batch]
+      lin_vel_b = lin_vel_bs[batch]
+      ang_vel_b = ang_vel_bs[batch]
+
+      if np.linalg.norm(base_pos_w) < 1e-6:
+        continue
+
+      def _l2w(v, p=base_pos_w, m=base_mat_w):
+        return p + m @ v
+
+      o = _l2w(np.array([0, 0, z_offset]) * scale)
+      # Command linear velocity (blue).
+      visualizer.add_arrow(
+        o, _l2w((np.array([0, 0, z_offset]) + np.array([cmd[0], cmd[1], 0])) * scale),
+        color=(0.2, 0.2, 0.6, 0.6), width=0.015,
+      )
+      # Command angular velocity (green).
+      visualizer.add_arrow(
+        o, _l2w((np.array([0, 0, z_offset]) + np.array([0, 0, cmd[2]])) * scale),
+        color=(0.2, 0.6, 0.2, 0.6), width=0.015,
+      )
+      # Actual linear velocity (cyan).
+      visualizer.add_arrow(
+        o, _l2w((np.array([0, 0, z_offset]) + np.array([lin_vel_b[0], lin_vel_b[1], 0])) * scale),
+        color=(0.0, 0.6, 1.0, 0.7), width=0.015,
+      )
+      # Actual angular velocity (light green).
+      visualizer.add_arrow(
+        o, _l2w((np.array([0, 0, z_offset]) + np.array([0, 0, ang_vel_b[2]])) * scale),
+        color=(0.0, 1.0, 0.4, 0.7), width=0.015,
+      )
+
+  # ── GUI ────────────────────────────────────────────────────────────────
+
+  def create_gui(
+    self,
+    name: str,
+    server: "viser.ViserServer",
+    get_env_idx: Callable[[], int],
+    on_change: Callable[..., None] | None = None,
+    request_action: Callable[..., None] | None = None,
+  ) -> None:
+    """Wrapper-owned joystick sliders (delegates' GUIs are never created)."""
+    from viser import Icon
+
+    axes = [
+      ("lin_vel_x", 5.0),
+      ("lin_vel_y", 3.0),
+      ("ang_vel_z", 2.0),
+    ]
+    sliders: list = []
+    with server.gui.add_folder(name.capitalize()):
+      enabled = server.gui.add_checkbox("Enable", initial_value=False)
+      for label, max_val in axes:
+        max_input = server.gui.add_slider(
+          f"Max {label}", initial_value=max_val, step=0.1, min=0.0, max=10.0,
+        )
+        slider = server.gui.add_slider(
+          label, min=-max_val, max=max_val, step=0.05, initial_value=0.0,
+        )
+
+        @max_input.on_update
+        def _(_ev, _s=slider, _m=max_input) -> None:
+          _s.min = -_m.value
+          _s.max = _m.value
+
+        sliders.append(slider)
+
+      zero_btn = server.gui.add_button("Zero", icon=Icon.SQUARE_X)
+
+      @zero_btn.on_click
+      def _(_) -> None:
+        for s in sliders:
+          s.value = 0.0
+
+    self._joystick_enabled = enabled
+    self._joystick_sliders = sliders
+    self._joystick_get_env_idx = get_env_idx
+
+
+@dataclass(kw_only=True)
+class MixedVelocityCommandCfg(CommandTermCfg):
+  """Configuration for ``MixedVelocityCommand``.
+
+  Runs a fraction of environments with ``DirectionalVelocityCommand`` and
+  the remainder with ``UniformVelocityCommand`` **simultaneously**.  The
+  per-env assignment is static (sampled once at init).
+  """
+
+  directional_cfg: DirectionalVelocityCommandCfg
+  """Directional sub-command for a fraction of envs."""
+
+  uniform_cfg: UniformVelocityCommandCfg
+  """Uniform sub-command for the remaining envs."""
+
+  directional_fraction: float = 0.3
+  """Fraction of envs assigned to directional (0.0 = all uniform,
+  1.0 = all directional).  Sampled uniformly at init, fixed thereafter."""
+
+  resampling_time_range: tuple[float, float] = (1e9, 1e9)
+  """Unused — each delegate manages its own resampling timer."""
+
+  @dataclass
+  class VizCfg:
+    z_offset: float = 0.2
+    scale: float = 0.5
+
+  viz: VizCfg = field(default_factory=VizCfg)
+
+  def build(self, env: ManagerBasedRlEnv) -> MixedVelocityCommand:
+    return MixedVelocityCommand(self, env)
