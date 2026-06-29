@@ -9,6 +9,8 @@ import numpy as np
 import torch
 
 from smp.motion.features import compute_motion_features
+from smp.motion.normalization import denormalize_quantiles
+from smp.pretrain.feature_masks import build_upper_lower_feature_masks
 from smp.pretrain.model import DiffusionDenoiser
 from smp.pretrain.scheduler import DDPMScheduler
 
@@ -69,9 +71,8 @@ def _is_tinymdm_checkpoint(ckpt: dict[str, Any]) -> bool:
 def load_denoiser(
   ckpt_path: str,
   device: torch.device | str,
-) -> tuple[DiffusionDenoiser, DDPMScheduler, torch.Tensor, torch.Tensor, int, int]:
-  """Load a frozen pretrained denoiser checkpoint → ``(model, scheduler, q_low,
-  q_high, feature_dim, window_size)``.
+) -> dict[str, Any]:
+  """Load a frozen pretrained denoiser checkpoint and return a metadata bundle.
 
   Accepts two checkpoint formats:
 
@@ -137,6 +138,8 @@ def load_denoiser(
 
   feature_dim = int(cfg["feature_dim"])
   window_size = int(cfg["window_size"])
+  conditional = bool(cfg.get("conditional", False))
+  style_names = tuple(cfg.get("style_names", ()))
 
   model = DiffusionDenoiser(
     feature_dim=feature_dim,
@@ -145,6 +148,8 @@ def load_denoiser(
     nhead=int(cfg.get("nhead", 8)),
     num_layers=int(cfg.get("num_layers", 2)),
     dropout=float(cfg.get("dropout", 0.0)),
+    num_classes=len(style_names) if conditional else 0,
+    cfg_dropout=float(cfg.get("cfg_dropout", 0.0)) if conditional else 0.0,
   ).to(device)
   model.load_state_dict(state, strict=False)
   model.eval()
@@ -157,7 +162,213 @@ def load_denoiser(
   q_low = torch.from_numpy(np.asarray(q_low, dtype=np.float32)).to(device)
   q_high = torch.from_numpy(np.asarray(q_high, dtype=np.float32)).to(device)
 
-  return model, scheduler, q_low, q_high, feature_dim, window_size
+  return {
+    "model": model,
+    "scheduler": scheduler,
+    "q_low": q_low,
+    "q_high": q_high,
+    "feature_dim": feature_dim,
+    "window_size": window_size,
+    "conditional": conditional,
+    "cfg_dropout": float(cfg.get("cfg_dropout", 0.0)) if conditional else 0.0,
+    "style_names": style_names,
+    "style_name_to_id": {name: idx for idx, name in enumerate(style_names)},
+    "prior_mode": "single",
+    "style_id": None,
+    "style_upper_id": None,
+    "style_lower_id": None,
+    "cfg_scale": 1.0,
+    "sampler": "ddpm",
+    "num_steps": None,
+  }
+
+
+class ClassifierFreeSampleModel(torch.nn.Module):
+  """Wrap a conditioned model for classifier-free guidance at inference time."""
+
+  def __init__(self, model: DiffusionDenoiser) -> None:
+    super().__init__()
+    self.model = model
+
+  def forward(
+    self,
+    x_t: torch.Tensor,
+    t: torch.Tensor,
+    class_labels: torch.Tensor,
+    cfg_scale: float = 1.0,
+  ) -> torch.Tensor:
+    batch_size = x_t.shape[0]
+    force_drop_ids = torch.cat(
+      (
+        torch.zeros(batch_size, device=x_t.device, dtype=torch.bool),
+        torch.ones(batch_size, device=x_t.device, dtype=torch.bool),
+      ),
+      dim=0,
+    )
+    x_dummy = torch.cat((x_t, x_t), dim=0)
+    t_dummy = torch.cat((t, t), dim=0)
+    labels_dummy = torch.cat((class_labels, class_labels), dim=0)
+    out = self.model(
+      x_dummy,
+      t_dummy,
+      class_labels=labels_dummy,
+      force_drop_ids=force_drop_ids,
+    )
+    cond_pred, uncond_pred = out.chunk(2, dim=0)
+    return uncond_pred + cfg_scale * (cond_pred - uncond_pred)
+
+
+def resolve_style_label(style_names: tuple[str, ...], style: str) -> int:
+  if style not in style_names:
+    msg = f"Unknown style '{style}'. Available styles: {', '.join(style_names)}"
+    raise ValueError(msg)
+  return style_names.index(style)
+
+
+def build_sampling_schedule(
+  num_timesteps: int,
+  sampler: str = "ddpm",
+  num_steps: int | None = None,
+) -> list[int]:
+  sampler = sampler.lower()
+  if sampler == "ddpm":
+    if num_steps is not None:
+      msg = "num_steps is only supported with sampler='ddim'"
+      raise ValueError(msg)
+    return list(range(num_timesteps - 1, -1, -1))
+  if sampler != "ddim":
+    msg = f"Unknown sampler '{sampler}'. Expected 'ddpm' or 'ddim'."
+    raise ValueError(msg)
+  if num_steps is None:
+    msg = "num_steps must be provided when sampler='ddim'"
+    raise ValueError(msg)
+  if not 1 <= num_steps <= num_timesteps:
+    msg = f"num_steps must be in [1, {num_timesteps}], got {num_steps}"
+    raise ValueError(msg)
+
+  timesteps = np.linspace(num_timesteps - 1, 0, num_steps)
+  schedule = [int(round(t)) for t in timesteps.tolist()]
+  for idx in range(1, len(schedule)):
+    if schedule[idx] >= schedule[idx - 1]:
+      schedule[idx] = max(schedule[idx - 1] - 1, 0)
+  schedule[-1] = 0
+  return schedule
+
+
+def _ddim_step(
+  scheduler: DDPMScheduler,
+  eps: torch.Tensor,
+  x_t: torch.Tensor,
+  t: int,
+  t_prev: int | None,
+) -> torch.Tensor:
+  alpha_t = scheduler.alphas_cumprod[t]
+  sqrt_alpha_t = torch.sqrt(alpha_t)
+  sqrt_one_minus_alpha_t = torch.sqrt(1.0 - alpha_t)
+  x_0_hat = (x_t - sqrt_one_minus_alpha_t * eps) / sqrt_alpha_t
+  if t_prev is None:
+    return x_0_hat
+  alpha_prev = scheduler.alphas_cumprod[t_prev]
+  return torch.sqrt(alpha_prev) * x_0_hat + torch.sqrt(1.0 - alpha_prev) * eps
+
+
+def _predict_eps(
+  model: DiffusionDenoiser,
+  x_t: torch.Tensor,
+  t_batch: torch.Tensor,
+  class_labels: torch.Tensor | None = None,
+  cfg_scale: float = 1.0,
+) -> torch.Tensor:
+  if class_labels is None:
+    return model(x_t, t_batch)
+  if cfg_scale == 1.0:
+    return model(x_t, t_batch, class_labels=class_labels)
+  return ClassifierFreeSampleModel(model)(
+    x_t,
+    t_batch,
+    class_labels=class_labels,
+    cfg_scale=cfg_scale,
+  )
+
+
+def predict_prior_noise(
+  bundle: dict[str, Any],
+  x_t: torch.Tensor,
+  t_batch: torch.Tensor,
+) -> torch.Tensor:
+  """Predict prior noise for either single-style or composed-style conditioning."""
+  model: DiffusionDenoiser = bundle["model"]
+  cfg_scale = float(bundle.get("cfg_scale", 1.0))
+  if bundle.get("prior_mode", "single") != "composed":
+    style_id = bundle.get("style_id")
+    class_labels = (
+      torch.full(
+        (x_t.shape[0],),
+        int(style_id),
+        dtype=torch.long,
+        device=x_t.device,
+      )
+      if style_id is not None
+      else None
+    )
+    return _predict_eps(model, x_t, t_batch, class_labels=class_labels, cfg_scale=cfg_scale)
+
+  feature_dim = int(bundle["feature_dim"])
+  upper_mask, lower_mask = build_upper_lower_feature_masks(feature_dim)
+  upper_mask = upper_mask.to(device=x_t.device).view(1, 1, feature_dim)
+  lower_mask = lower_mask.to(device=x_t.device).view(1, 1, feature_dim)
+  upper_id = int(bundle["style_upper_id"])
+  lower_id = int(bundle["style_lower_id"])
+  upper_labels = torch.full((x_t.shape[0],), upper_id, dtype=torch.long, device=x_t.device)
+  lower_labels = torch.full((x_t.shape[0],), lower_id, dtype=torch.long, device=x_t.device)
+  eps_upper = _predict_eps(
+    model,
+    x_t,
+    t_batch,
+    class_labels=upper_labels,
+    cfg_scale=cfg_scale,
+  ).clone()
+  eps_lower = _predict_eps(
+    model,
+    x_t,
+    t_batch,
+    class_labels=lower_labels,
+    cfg_scale=cfg_scale,
+  ).clone()
+  return upper_mask * eps_upper + lower_mask * eps_lower
+
+
+@torch.no_grad()
+def sample_prior_windows(
+  bundle: dict[str, Any],
+  n: int,
+  device: torch.device,
+) -> torch.Tensor:
+  """Sample denormalized motion windows from the configured prior bundle."""
+  model: DiffusionDenoiser = bundle["model"]
+  scheduler: DDPMScheduler = bundle["scheduler"]
+  q_low: torch.Tensor = bundle["q_low"]
+  q_high: torch.Tensor = bundle["q_high"]
+  feature_dim = int(bundle["feature_dim"])
+  window_size = int(bundle["window_size"])
+  sampler = str(bundle.get("sampler", "ddpm")).lower()
+  num_steps = bundle.get("num_steps")
+
+  x_t = torch.randn(n, window_size, feature_dim, device=device)
+  schedule = build_sampling_schedule(
+    scheduler.num_timesteps,
+    sampler=sampler,
+    num_steps=num_steps,
+  )
+  for idx, t in enumerate(schedule):
+    t_batch = torch.full((n,), t, dtype=torch.long, device=device)
+    eps = predict_prior_noise(bundle, x_t, t_batch)
+    if sampler == "ddpm":
+      x_t = scheduler.step(eps, x_t, t)
+    else:
+      t_prev = schedule[idx + 1] if idx + 1 < len(schedule) else None
+      x_t = _ddim_step(scheduler, eps, x_t, t, t_prev)
+  return denormalize_quantiles(x_t, q_low, q_high)
 
 
 class DiffNormalizer:

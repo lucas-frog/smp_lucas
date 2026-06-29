@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from smp.motion.normalization import normalize_quantiles
-from smp.rl.utils import DiffNormalizer, MotionFeatureBuffer
+from smp.rl.utils import DiffNormalizer, MotionFeatureBuffer, predict_prior_noise
 
 if TYPE_CHECKING:
   from collections.abc import Callable
@@ -51,7 +51,10 @@ def smp_guidance_reward(
   effective temporal span of the 10-frame window (e.g. ``subsample_steps=5`` with
   50 Hz policy → window covers 1.0 s instead of 0.2 s)."""
   device = torch.device(env.device)
-  model, scheduler, q_low, q_high, _, _ = env._smp_bundle  # type: ignore[attr-defined]
+  bundle = env._smp_bundle  # type: ignore[attr-defined]
+  scheduler = bundle["scheduler"]
+  q_low = bundle["q_low"]
+  q_high = bundle["q_high"]
   normalizer: DiffNormalizer = env._smp_normalizer  # type: ignore[attr-defined]
   buffer: MotionFeatureBuffer = env._smp_buffer  # type: ignore[attr-defined]
 
@@ -77,7 +80,7 @@ def smp_guidance_reward(
       t = torch.full((num_envs,), t_scalar, dtype=torch.long, device=device)
       noise = torch.randn_like(x_0)
       x_t = scheduler.add_noise(x_0, noise, t)
-      eps_hat = model(x_t, t)
+      eps_hat = predict_prior_noise(bundle, x_t, t)
       mse_per_env = ((eps_hat - noise) ** 2).mean(dim=(-1, -2))
       total_raw += mse_per_env
       if normalize:
@@ -88,6 +91,125 @@ def smp_guidance_reward(
   env._smp_raw_err = total_raw / len(fixed_timesteps)  # type: ignore[attr-defined]
   err = total_err / len(fixed_timesteps)
   return torch.exp(-err * ws)
+
+
+def _task_terms_signature(task_terms: tuple[TaskTerm, ...]) -> tuple:
+  """Build a stable signature for task-term caching across deep-copied cfgs."""
+  return tuple(
+    (
+      func.__module__,
+      func.__qualname__,
+      float(weight),
+      tuple(sorted((key, repr(value)) for key, value in kwargs.items())),
+    )
+    for func, weight, kwargs in task_terms
+  )
+
+
+def _ensure_task_smp_cache(
+  env: ManagerBasedRlEnv,
+  task_terms: tuple[TaskTerm, ...],
+  fixed_timesteps: tuple[int, ...],
+  ws: float,
+  subsample_steps: int,
+) -> dict[str, Any]:
+  """Compute task/SMP reward components once per env step and cache them."""
+  cache_key = "_task_smp_cache"
+  fixed_timesteps = tuple(fixed_timesteps)
+  step = int(env.common_step_counter)
+  task_terms_signature = _task_terms_signature(task_terms)
+
+  if hasattr(env, cache_key):
+    cache = getattr(env, cache_key)
+    if (
+      cache["step"] == step
+      and cache["task_terms_signature"] == task_terms_signature
+      and cache["fixed_timesteps"] == fixed_timesteps
+      and cache["ws"] == ws
+      and cache["subsample_steps"] == subsample_steps
+    ):
+      return cache
+
+  task_components: dict[str, torch.Tensor] = {}
+  task: torch.Tensor | None = None
+  for func, weight, kwargs in task_terms:
+    component = weight * func(env, **kwargs)
+    if task is None:
+      task = torch.zeros_like(component)
+    task += component
+    name = func.__name__
+    if name in task_components:
+      task_components[name] = task_components[name] + component
+    else:
+      task_components[name] = component
+
+  if task is None:
+    msg = "task_terms must contain at least one task reward component."
+    raise ValueError(msg)
+
+  smp = smp_guidance_reward(
+    env,
+    fixed_timesteps=fixed_timesteps,
+    ws=ws,
+    subsample_steps=subsample_steps,
+  )
+  smp_raw_err = getattr(env, "_smp_raw_err", torch.zeros_like(task))
+
+  cache = {
+    "step": step,
+    "task_terms_signature": task_terms_signature,
+    "fixed_timesteps": fixed_timesteps,
+    "ws": ws,
+    "subsample_steps": subsample_steps,
+    "task": task,
+    "smp": smp,
+    "product": task * smp,
+    "sum": task + smp,
+    "task_components": task_components,
+    "smp_raw_err": smp_raw_err,
+  }
+  setattr(env, cache_key, cache)
+  return cache
+
+
+def _combine_cached_reward(
+  cache: dict[str, Any],
+  combine_mode: str,
+  task_scale: float = 1.0,
+  smp_scale: float = 1.0,
+) -> torch.Tensor:
+  if combine_mode == "product":
+    return cache["product"]
+  if combine_mode == "sum":
+    return task_scale * cache["task"] + smp_scale * cache["smp"]
+  msg = f"Unsupported combine_mode '{combine_mode}'. Expected 'product' or 'sum'."
+  raise ValueError(msg)
+
+
+def combined_reward(
+  env: ManagerBasedRlEnv,
+  task_terms: tuple[TaskTerm, ...],
+  fixed_timesteps: tuple[int, ...] = (8, 15, 22),
+  ws: float = 6.0,
+  combine_mode: str = "product",
+  task_scale: float = 1.0,
+  smp_scale: float = 1.0,
+  subsample_steps: int = 1,
+) -> torch.Tensor:
+  """Combine task and SMP rewards using either ``product`` or ``sum`` mode."""
+  cache = _ensure_task_smp_cache(
+    env,
+    task_terms=task_terms,
+    fixed_timesteps=fixed_timesteps,
+    ws=ws,
+    subsample_steps=subsample_steps,
+  )
+  return _combine_cached_reward(
+    cache,
+    combine_mode,
+    task_scale=task_scale,
+    smp_scale=smp_scale,
+  )
 
 
 def task_smp_product(
@@ -110,16 +232,115 @@ def task_smp_product(
   ``subsample_steps`` is forwarded to ``smp_guidance_reward`` to control the
   effective temporal window of the motion-prior feature buffer.
   """
-  r_smp = smp_guidance_reward(
+  del command_name
+  cache = _ensure_task_smp_cache(
     env,
+    task_terms=task_terms,
     fixed_timesteps=fixed_timesteps,
     ws=ws,
     subsample_steps=subsample_steps,
   )
-  # if command_name:
-  #   cmd_term = env.command_manager.get_term(command_name)
-  #   if cmd_term is not None and hasattr(cmd_term, "is_standing_env"):
-  #     standing = cmd_term.is_standing_env
-  #     r_smp = torch.where(standing, torch.ones_like(r_smp), r_smp)
-  task = sum(w * func(env, **kw) for func, w, kw in task_terms)
-  return task * r_smp
+  return cache["product"]
+
+
+def task_reward_metric(
+  env: ManagerBasedRlEnv,
+  task_terms: tuple[TaskTerm, ...],
+  fixed_timesteps: tuple[int, ...] = (8, 15, 22),
+  ws: float = 6.0,
+  subsample_steps: int = 1,
+) -> torch.Tensor:
+  """Per-step task reward contribution before reward-manager scaling."""
+  cache = _ensure_task_smp_cache(
+    env,
+    task_terms=task_terms,
+    fixed_timesteps=fixed_timesteps,
+    ws=ws,
+    subsample_steps=subsample_steps,
+  )
+  return cache["task"]
+
+
+def smp_reward_metric(
+  env: ManagerBasedRlEnv,
+  task_terms: tuple[TaskTerm, ...],
+  fixed_timesteps: tuple[int, ...] = (8, 15, 22),
+  ws: float = 6.0,
+  subsample_steps: int = 1,
+) -> torch.Tensor:
+  """Per-step SMP guidance reward before reward-manager scaling."""
+  cache = _ensure_task_smp_cache(
+    env,
+    task_terms=task_terms,
+    fixed_timesteps=fixed_timesteps,
+    ws=ws,
+    subsample_steps=subsample_steps,
+  )
+  return cache["smp"]
+
+
+def total_reward_metric(
+  env: ManagerBasedRlEnv,
+  task_terms: tuple[TaskTerm, ...],
+  fixed_timesteps: tuple[int, ...] = (8, 15, 22),
+  ws: float = 6.0,
+  combine_mode: str = "product",
+  task_scale: float = 1.0,
+  smp_scale: float = 1.0,
+  subsample_steps: int = 1,
+) -> torch.Tensor:
+  """Per-step total reward value before reward-manager scaling."""
+  cache = _ensure_task_smp_cache(
+    env,
+    task_terms=task_terms,
+    fixed_timesteps=fixed_timesteps,
+    ws=ws,
+    subsample_steps=subsample_steps,
+  )
+  return _combine_cached_reward(
+    cache,
+    combine_mode,
+    task_scale=task_scale,
+    smp_scale=smp_scale,
+  )
+
+
+def task_term_metric(
+  env: ManagerBasedRlEnv,
+  term_name: str,
+  task_terms: tuple[TaskTerm, ...],
+  fixed_timesteps: tuple[int, ...] = (8, 15, 22),
+  ws: float = 6.0,
+  subsample_steps: int = 1,
+) -> torch.Tensor:
+  """Per-step weighted contribution of a single task reward term."""
+  cache = _ensure_task_smp_cache(
+    env,
+    task_terms=task_terms,
+    fixed_timesteps=fixed_timesteps,
+    ws=ws,
+    subsample_steps=subsample_steps,
+  )
+  if term_name not in cache["task_components"]:
+    available = ", ".join(sorted(cache["task_components"]))
+    msg = f"Unknown task reward term '{term_name}'. Available: {available}"
+    raise ValueError(msg)
+  return cache["task_components"][term_name]
+
+
+def smp_raw_err_metric(
+  env: ManagerBasedRlEnv,
+  task_terms: tuple[TaskTerm, ...],
+  fixed_timesteps: tuple[int, ...] = (8, 15, 22),
+  ws: float = 6.0,
+  subsample_steps: int = 1,
+) -> torch.Tensor:
+  """Per-step mean raw SMP denoising error before exponentiation."""
+  cache = _ensure_task_smp_cache(
+    env,
+    task_terms=task_terms,
+    fixed_timesteps=fixed_timesteps,
+    ws=ws,
+    subsample_steps=subsample_steps,
+  )
+  return cache["smp_raw_err"]

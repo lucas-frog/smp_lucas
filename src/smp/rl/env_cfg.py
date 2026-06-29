@@ -39,6 +39,41 @@ from smp.rl.events import (
 )
 
 
+def configure_smp_prior(
+  cfg: ManagerBasedRlEnvCfg,
+  *,
+  ckpt_path: str | None = None,
+  prior_mode: str | None = None,
+  style: str | None = None,
+  style_upper: str | None = None,
+  style_lower: str | None = None,
+  cfg_scale: float | None = None,
+  sampler: str | None = None,
+  num_steps: int | None = None,
+) -> ManagerBasedRlEnvCfg:
+  """Update only the SMP startup event params, preserving old defaults elsewhere."""
+  params = cfg.events["init_smp_state"].params
+  if ckpt_path is not None:
+    params["ckpt_path"] = ckpt_path
+  if prior_mode is not None:
+    params["prior_mode"] = prior_mode
+  if style is not None:
+    params["style"] = style
+  if style_upper is not None:
+    params["style_upper"] = style_upper
+  if style_lower is not None:
+    params["style_lower"] = style_lower
+  if cfg_scale is not None:
+    params["cfg_scale"] = cfg_scale
+  if sampler is not None:
+    params["sampler"] = sampler
+  if sampler == "ddim":
+    params["num_steps"] = num_steps
+  elif num_steps is not None:
+    params["num_steps"] = num_steps
+  return cfg
+
+
 def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   """Build the shared G1 + SMP env cfg (denoiser ckpt path set on
   ``init_smp_state`` below; override it from the task config)."""

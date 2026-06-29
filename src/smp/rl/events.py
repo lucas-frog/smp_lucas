@@ -16,8 +16,13 @@ from mjlab.envs import ManagerBasedRlEnv
 from mjlab.managers.action_manager import ActionTerm
 
 from smp.motion.math import quat_apply, quat_mul, yaw_quat
-from smp.motion.normalization import denormalize_quantiles
-from smp.rl.utils import DiffNormalizer, MotionFeatureBuffer, load_denoiser
+from smp.rl.utils import (
+  DiffNormalizer,
+  MotionFeatureBuffer,
+  load_denoiser,
+  resolve_style_label,
+  sample_prior_windows,
+)
 from smp.sampling.feature_to_state import (
   EE_BODY_NAMES,
   NUM_EE,
@@ -106,6 +111,13 @@ def init_smp_state(
   gsi_batch_size: int = 256,
   compile_model: bool = True,
   compile_mode: str | None = None,
+  prior_mode: str = "single",
+  style: str = "",
+  style_upper: str = "",
+  style_lower: str = "",
+  cfg_scale: float = 1.0,
+  sampler: str = "ddpm",
+  num_steps: int | None = None,
 ) -> None:
   """Startup-mode event: load the frozen denoiser, allocate the feature buffer +
   ``DiffNormalizer`` (stashed on the env), and pre-generate the GSI pool of
@@ -120,18 +132,39 @@ def init_smp_state(
       "params={'ckpt_path': '/path/to/pretrained.pt'})."
     )
     raise RuntimeError(msg)
-  model, scheduler, q_low, q_high, feature_dim, window_size = load_denoiser(
-    ckpt_path, env.device
-  )
-  model = _maybe_compile(model, compile_model, compile_mode)
-  env._smp_bundle = (  # type: ignore[attr-defined]
-    model,
-    scheduler,
-    q_low,
-    q_high,
-    feature_dim,
-    window_size,
-  )
+  bundle = load_denoiser(ckpt_path, env.device)
+  bundle["model"] = _maybe_compile(bundle["model"], compile_model, compile_mode)
+
+  prior_mode = prior_mode.lower()
+  if prior_mode not in {"single", "composed"}:
+    msg = f"Unknown prior_mode '{prior_mode}'. Expected 'single' or 'composed'."
+    raise ValueError(msg)
+  bundle["prior_mode"] = prior_mode
+  bundle["cfg_scale"] = float(cfg_scale)
+  bundle["sampler"] = sampler.lower()
+  bundle["num_steps"] = num_steps
+
+  conditional = bool(bundle["conditional"])
+  style_names: tuple[str, ...] = bundle["style_names"]
+  if prior_mode == "composed":
+    if not conditional:
+      msg = "prior_mode='composed' requires a conditional prior checkpoint."
+      raise ValueError(msg)
+    if not style_upper or not style_lower:
+      msg = "prior_mode='composed' requires both style_upper and style_lower."
+      raise ValueError(msg)
+    bundle["style_upper_id"] = resolve_style_label(style_names, style_upper)
+    bundle["style_lower_id"] = resolve_style_label(style_names, style_lower)
+  elif style:
+    if not conditional:
+      msg = "style requires a conditional prior checkpoint."
+      raise ValueError(msg)
+    bundle["style_id"] = resolve_style_label(style_names, style)
+
+  feature_dim = int(bundle["feature_dim"])
+  window_size = int(bundle["window_size"])
+  scheduler = bundle["scheduler"]
+  env._smp_bundle = bundle  # type: ignore[attr-defined]
   robot = env.scene["robot"]
   env._smp_ee_indexes = torch.tensor(  # type: ignore[attr-defined]
     robot.find_bodies(list(EE_BODY_NAMES), preserve_order=True)[0],
@@ -153,7 +186,7 @@ def init_smp_state(
   pool_chunks: list[torch.Tensor] = []
   for start in range(0, gsi_buffer_size, gsi_batch_size):
     bsz = min(gsi_batch_size, gsi_buffer_size - start)
-    pool_chunks.append(_ddpm_sample(env, bsz))
+    pool_chunks.append(_sample_windows(env, bsz))
   env._smp_gsi_pool = torch.cat(pool_chunks, dim=0)  # type: ignore[attr-defined]
 
   if compile_model and env.num_envs != gsi_batch_size:
@@ -161,7 +194,25 @@ def init_smp_state(
     with torch.no_grad():
       dummy_x = torch.randn(env.num_envs, window_size, feature_dim, device=env.device)
       dummy_t = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
-      _ = model(dummy_x, dummy_t)
+      if prior_mode == "composed":
+        _ = bundle["model"](
+          dummy_x,
+          dummy_t,
+          class_labels=torch.zeros(env.num_envs, dtype=torch.long, device=env.device),
+        )
+      elif bundle.get("style_id") is not None:
+        _ = bundle["model"](
+          dummy_x,
+          dummy_t,
+          class_labels=torch.full(
+            (env.num_envs,),
+            int(bundle["style_id"]),
+            dtype=torch.long,
+            device=env.device,
+          ),
+        )
+      else:
+        _ = bundle["model"](dummy_x, dummy_t)
 
   gsi_reset(env)
 
@@ -246,15 +297,10 @@ def _prime_sim_and_buffer(
 
 
 @torch.no_grad()
-def _ddpm_sample(env: ManagerBasedRlEnv, n: int) -> torch.Tensor:
-  """Run DDPM ancestral sampling and return ``n`` denormalized windows."""
-  model, scheduler, q_low, q_high, feature_dim, window_size = env._smp_bundle  # type: ignore[attr-defined]
-  x_t = torch.randn(n, window_size, feature_dim, device=env.device)
-  for t_int in reversed(range(scheduler.num_timesteps)):
-    t = torch.full((n,), t_int, dtype=torch.long, device=env.device)
-    eps = model(x_t, t)
-    x_t = scheduler.step(eps, x_t, t_int)
-  return denormalize_quantiles(x_t, q_low, q_high)
+def _sample_windows(env: ManagerBasedRlEnv, n: int) -> torch.Tensor:
+  """Sample denormalized windows using the configured single or composed prior."""
+  bundle: dict[str, object] = env._smp_bundle  # type: ignore[attr-defined]
+  return sample_prior_windows(bundle, n=n, device=torch.device(env.device))
 
 
 @torch.no_grad()
@@ -277,7 +323,7 @@ def gsi_refresh(
     msg = f"num_samples ({num_samples}) cannot exceed pool size ({pool_size})"
     raise ValueError(msg)
 
-  new_windows = _ddpm_sample(env, num_samples)
+  new_windows = _sample_windows(env, num_samples)
   head = int(getattr(env, "_smp_gsi_head", 0))
   end = head + num_samples
   if end <= pool_size:

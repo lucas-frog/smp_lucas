@@ -8,6 +8,7 @@ task signal aligns with the SMP motion prior.
 from __future__ import annotations
 
 from mjlab.envs import ManagerBasedRlEnvCfg
+from mjlab.managers.metrics_manager import MetricsTermCfg
 from mjlab.managers.observation_manager import ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.curriculum_manager import CurriculumTermCfg
@@ -16,12 +17,178 @@ from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.sensor.contact_sensor import ContactMatch, ContactSensorCfg
 
 from smp.rl.env_cfg import g1_smp_env_cfg
-from smp.rl.rewards import task_smp_product
+from smp.rl.env_cfg import configure_smp_prior
+from smp.rl.rewards import combined_reward
+from smp.rl.rewards import smp_raw_err_metric
+from smp.rl.rewards import smp_reward_metric
+from smp.rl.rewards import task_reward_metric
+from smp.rl.rewards import task_term_metric
+from smp.rl.rewards import total_reward_metric
 from smp.rl.tasks.localization import mdp
 
 import math
 
-def g1_velocity_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+_WALKRUN_SINGLE_STYLE_CKPT = (
+  "/home/hjqsyy/smp/logs/pretrain/cond_walkrun_getup1_ws10_balanced_v1/"
+  "20260628_181948/checkpoint_02900.pt"
+)
+
+
+def _default_velocity_task_terms() -> tuple[tuple, ...]:
+  return (
+    (
+      mdp.track_linear_velocity,
+      1.0,
+      {"command_name": "twist", "std": math.sqrt(1), "reverse_penalty": True},
+    ),
+    (
+      mdp.track_angular_velocity,
+      0.5,
+      {"command_name": "twist", "std": math.sqrt(1)},
+    ),
+    (
+      mdp.action_rate_l2,
+      -0.05,
+      {},
+    ),
+    (
+      mdp.joint_pos_limits,
+      -10.0,
+      {"asset_cfg": SceneEntityCfg("robot", joint_names=".*")},
+    ),
+    (
+      mdp.body_ang_vel,
+      -0.05,
+      {"asset_cfg": SceneEntityCfg("robot", body_names=("torso_link",))},
+    ),
+    (
+      mdp.variable_posture,
+      0.3,
+      {
+        "std_standing": {".*": 0.05},
+        "std_walking": {
+          r".*hip_pitch.*": 0.5,
+          r".*hip_roll.*": 0.15,
+          r".*hip_yaw.*": 0.15,
+          r".*knee.*": 0.5,
+          r".*ankle_pitch.*": 0.15,
+          r".*ankle_roll.*": 0.1,
+          r".*waist_yaw.*": 0.15,
+          r".*waist_roll.*": 0.1,
+          r".*waist_pitch.*": 0.1,
+          r".*shoulder_pitch.*": 0.15,
+          r".*shoulder_roll.*": 0.1,
+          r".*shoulder_yaw.*": 0.1,
+          r".*elbow.*": 0.1,
+          r".*wrist.*": 0.1,
+        },
+        "std_running": {
+          r".*hip_pitch.*": 0.5,
+          r".*hip_roll.*": 0.25,
+          r".*hip_yaw.*": 0.25,
+          r".*knee.*": 0.5,
+          r".*ankle_pitch.*": 0.25,
+          r".*ankle_roll.*": 0.1,
+          r".*waist_yaw.*": 0.25,
+          r".*waist_roll.*": 0.1,
+          r".*waist_pitch.*": 0.1,
+          r".*shoulder_pitch.*": 0.25,
+          r".*shoulder_roll.*": 0.1,
+          r".*shoulder_yaw.*": 0.1,
+          r".*elbow.*": 0.1,
+          r".*wrist.*": 0.1,
+        },
+        "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+        "command_name": "twist",
+        "walking_threshold": 0.1,
+      },
+    ),
+  )
+
+
+def _legacy_product_velocity_task_terms() -> tuple[tuple, ...]:
+  """Reproduce the lean product reward stack from the earlier stable run."""
+  return (
+    (
+      mdp.track_linear_velocity,
+      1.0,
+      {"command_name": "twist", "std": math.sqrt(1), "reverse_penalty": True},
+    ),
+    (
+      mdp.track_angular_velocity,
+      0.5,
+      {"command_name": "twist", "std": math.sqrt(1)},
+    ),
+    (
+      mdp.action_rate_l2,
+      -0.05,
+      {},
+    ),
+  )
+
+
+def _configure_velocity_reward_stack(
+  cfg: ManagerBasedRlEnvCfg,
+  *,
+  task_terms: tuple[tuple, ...],
+  reward_mode: str,
+  task_scale: float,
+  smp_scale: float,
+) -> None:
+  reward_params = {
+    "task_terms": task_terms,
+    "combine_mode": reward_mode,
+    "task_scale": task_scale,
+    "smp_scale": smp_scale,
+  }
+  cfg.rewards["total_reward"] = RewardTermCfg(
+    func=combined_reward,
+    weight=1.0,
+    params=reward_params,
+  )
+
+  for metric_name in tuple(cfg.metrics):
+    if (
+      metric_name in {"task_reward", "smp_reward", "total_reward", "smp_raw_err"}
+      or metric_name.startswith("task_")
+    ):
+      del cfg.metrics[metric_name]
+
+  cfg.metrics["task_reward"] = MetricsTermCfg(
+    func=task_reward_metric,
+    params={"task_terms": task_terms},
+  )
+  cfg.metrics["smp_reward"] = MetricsTermCfg(
+    func=smp_reward_metric,
+    params={"task_terms": task_terms},
+  )
+  cfg.metrics["total_reward"] = MetricsTermCfg(
+    func=total_reward_metric,
+    params=reward_params,
+  )
+  seen_task_terms: set[str] = set()
+  for func, _weight, _params in task_terms:
+    term_name = func.__name__
+    metric_name = f"task_{term_name}"
+    if metric_name in seen_task_terms:
+      continue
+    cfg.metrics[metric_name] = MetricsTermCfg(
+      func=task_term_metric,
+      params={"task_terms": task_terms, "term_name": term_name},
+    )
+    seen_task_terms.add(metric_name)
+  cfg.metrics["smp_raw_err"] = MetricsTermCfg(
+    func=smp_raw_err_metric,
+    params={"task_terms": task_terms},
+  )
+
+
+def g1_velocity_smp_env_cfg(
+  play: bool = False,
+  reward_mode: str = "product",
+  task_scale: float = 1.0,
+  smp_scale: float = 1.0,
+) -> ManagerBasedRlEnvCfg:
   """Build the G1 forward env cfg with SMP guidance."""
   cfg = g1_smp_env_cfg(play=play)
 
@@ -178,78 +345,20 @@ def g1_velocity_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # cfg.observations["critic"].terms["phase"] = phase_obs
 
   # --- Rewards -------------------------------------------------------------
-  # task = velocity tracking, gated by SMP.
-  cfg.rewards["task_smp_product"] = RewardTermCfg(
-    func=task_smp_product,
-    weight=1.0,
-    params={
-      "command_name": "twist",
-      # "fixed_timesteps": (2, 5, 8, 15, 22),
-      "task_terms": (
-        (
-            mdp.track_linear_velocity,
-            1.0,
-            {"command_name": "twist", "std": math.sqrt(1), "reverse_penalty": True},
-        ),
-        # (
-        #   mdp.track_linear_velocity_world,
-        #   1.0,
-        #   {"command_name": "twist", "std": math.sqrt(2.0)},
-        # ),
-        (
-            mdp.track_angular_velocity,
-            0.5,
-            {"command_name": "twist", "std": math.sqrt(1)},
-        ),
-        (
-            mdp.action_rate_l2,
-            -0.05,
-            {},
-        ),
-        # (
-        #   mdp.stand_still,
-        #   -0.5,
-        #   {
-        #     "command_name": "twist",
-        #     "command_threshold": 0.1,
-        #     "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
-        #   },
-        # ),
-        # (
-        #     mdp.stand_still,
-        #     -0.3,
-        #     {
-        #         "command_name": "twist",
-        #         "command_threshold": 0.1,
-        #         "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
-        #     },
-        # ),
-        # (
-        #   mdp.feet_gait,
-        #   0.5,
-        #   {
-        #     "period": 0.6,
-        #     "offset": [0.0, 0.5],
-        #     "threshold": 0.56,
-        #     "command_threshold": 0.1,
-        #     "command_name": "twist",
-        #     "sensor_name": "feet_ground_contact",
-        #   },
-        # ),
-        # (
-        #     mdp.feet_gait,
-        #     0.3,
-        #     {
-        #         "period": 0.6,
-        #         "offset": [0.0, 0.5],
-        #         "threshold": 0.56,
-        #         "command_threshold": 0.1,
-        #         "command_name": "twist",
-        #         "sensor_name": "feet_ground_contact",
-        #     },
-        # ),
-      ),
-    },
+  task_terms = (
+    # (
+    #   mdp.track_linear_velocity_world,
+    #   1.0,
+    #   {"command_name": "twist", "std": math.sqrt(2.0)},
+    # ),
+    *_default_velocity_task_terms(),
+  )
+  _configure_velocity_reward_stack(
+    cfg,
+    task_terms=task_terms,
+    reward_mode=reward_mode,
+    task_scale=task_scale,
+    smp_scale=smp_scale,
   )
 
   # # Zero-weight standalone tracking terms monitored by the curriculum.
@@ -267,7 +376,7 @@ def g1_velocity_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # --- Events --------------------------------------------------------------
   cfg.events["init_smp_state"].params["ckpt_path"] = (
     # "datasets/pretrain_ckpt/pretrained_loco.pt"
-    "logs/pretrain/pretrain/20260604_192628/pretrained.pt"
+    "datasets/pretrain_ckpt/pretrain_30.pt"
   )
 
 
@@ -293,11 +402,152 @@ def g1_velocity_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   #     func=mdp.velocity_cmd_levels,
   #     params={
   #       "command_name": "twist",
-  #       "reward_term_names": ["task_smp_product"],
+  #       "reward_term_names": ["total_reward"],
   #       "threshold_ratio": 0.8,
   #       "delta": 0.1,
   #     },
   #   ),
   # }
 
+  return cfg
+
+
+def g1_velocity_composed_smp_env_cfg(
+  play: bool = False,
+  reward_mode: str = "product",
+  task_scale: float = 1.0,
+  smp_scale: float = 1.0,
+) -> ManagerBasedRlEnvCfg:
+  """Velocity task variant using a composed upper/lower conditional prior."""
+  cfg = g1_velocity_smp_env_cfg(
+    play=play,
+    reward_mode=reward_mode,
+    task_scale=task_scale,
+    smp_scale=smp_scale,
+  )
+  cfg.commands["twist"] = mdp.MixedVelocityCommandCfg(
+    directional_cfg=mdp.DirectionalVelocityCommandCfg(
+      entity_name="robot",
+      rel_forward=0.85,
+      rel_backward=0.0,
+      rel_left=0.0,
+      rel_right=0.0,
+      rel_standing=0.15,
+      rel_ang_overlay=0.25,
+      forward_speed=(0.5, 2.4),
+      backward_speed=(0.2, 0.6),
+      lateral_speed=(0.1, 0.25),
+      ang_speed=(0.15, 0.45),
+      debug_vis=False,
+    ),
+    uniform_cfg=mdp.UniformVelocityCommandCfg(
+      entity_name="robot",
+      resampling_time_range=(4.0, 8.0),
+      rel_standing_envs=0.15,
+      rel_heading_envs=0.0,
+      rel_forward_envs=0.0,
+      heading_command=False,
+      heading_control_stiffness=0.5,
+      debug_vis=False,
+      ranges=mdp.UniformVelocityCommandCfg.Ranges(
+        lin_vel_x=(0.5, 2.6),
+        lin_vel_y=(-0.25, 0.25),
+        ang_vel_z=(-0.45, 0.45),
+      ),
+    ),
+    directional_fraction=0.7,
+    debug_vis=True,
+  )
+  configure_smp_prior(
+    cfg,
+    ckpt_path="/home/hjqsyy/smp/logs/pretrain/cond_walk4_ws10_v1/20260622_213521/pretrained.pt",
+    prior_mode="composed",
+    style_upper="walk_guai1",
+    style_lower="walk_guai2",
+    cfg_scale=1.0,
+    sampler="ddim",
+    num_steps=10,
+  )
+  return cfg
+
+
+def g1_velocity_single_style_smp_env_cfg(
+  play: bool = False,
+  reward_mode: str = "product",
+  task_scale: float = 1.0,
+  smp_scale: float = 1.0,
+) -> ManagerBasedRlEnvCfg:
+  """Velocity task variant using one style from the multi-style conditional prior."""
+  cfg = g1_velocity_smp_env_cfg(
+    play=play,
+    reward_mode=reward_mode,
+    task_scale=task_scale,
+    smp_scale=smp_scale,
+  )
+  cfg.commands["twist"] = mdp.MixedVelocityCommandCfg(
+    directional_cfg=mdp.DirectionalVelocityCommandCfg(
+      entity_name="robot",
+      rel_forward=0.85,
+      rel_backward=0.0,
+      rel_left=0.0,
+      rel_right=0.0,
+      rel_standing=0.15,
+      rel_ang_overlay=0.25,
+      forward_speed=(0.5, 2.4),
+      backward_speed=(0.2, 0.6),
+      lateral_speed=(0.1, 0.25),
+      ang_speed=(0.15, 0.45),
+      debug_vis=False,
+    ),
+    uniform_cfg=mdp.UniformVelocityCommandCfg(
+      entity_name="robot",
+      resampling_time_range=(4.0, 8.0),
+      rel_standing_envs=0.15,
+      rel_heading_envs=0.0,
+      rel_forward_envs=0.0,
+      heading_command=False,
+      heading_control_stiffness=0.5,
+      debug_vis=False,
+      ranges=mdp.UniformVelocityCommandCfg.Ranges(
+        lin_vel_x=(0.5, 2.6),
+        lin_vel_y=(-0.25, 0.25),
+        ang_vel_z=(-0.45, 0.45),
+      ),
+    ),
+    directional_fraction=0.7,
+    debug_vis=True,
+  )
+  configure_smp_prior(
+    cfg,
+    ckpt_path="/home/hjqsyy/smp/logs/pretrain/cond_walk4_ws10_v1/20260622_213521/pretrained.pt",
+    prior_mode="single",
+    style="walk_guai2",
+    cfg_scale=1.0,
+    sampler="ddim",
+    num_steps=10,
+  )
+  return cfg
+
+
+def g1_velocity_walkrun_product_smp_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """Single-style walkrun validation task using the older product baseline."""
+  cfg = g1_velocity_smp_env_cfg(play=play)
+  _configure_velocity_reward_stack(
+    cfg,
+    task_terms=_legacy_product_velocity_task_terms(),
+    reward_mode="product",
+    task_scale=1.0,
+    smp_scale=1.0,
+  )
+  configure_smp_prior(
+    cfg,
+    ckpt_path=_WALKRUN_SINGLE_STYLE_CKPT,
+    prior_mode="single",
+    style="walkrun",
+    cfg_scale=1.0,
+    sampler="ddim",
+    num_steps=10,
+  )
   return cfg
