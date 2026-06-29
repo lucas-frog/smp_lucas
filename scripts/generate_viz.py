@@ -1,5 +1,5 @@
-"""Unconditionally generate a motion window with a trained SMP diffusion model
-and visualize the predicted trajectory in a viser viewer.
+"""Generate a motion window with a trained SMP diffusion model and visualize
+the predicted trajectory in a viser viewer.
 
 Features carry ``root_pos`` (xy heading-inv + world z) and ``root_rot``
 (6D tan-norm, heading-inv relative to the last-frame root), so the
@@ -24,9 +24,12 @@ import viser
 from mjlab.entity import Entity
 from mjlab.viewer.viser.scene import MjlabViserScene
 
-from smp.motion.normalization import denormalize_quantiles
-from smp.pretrain.model import DiffusionDenoiser
-from smp.pretrain.scheduler import DDPMScheduler
+from smp.pretrain.inference import (
+  build_model_and_scheduler,
+  resolve_style_label,
+  sample_window_composed,
+  sample_window,
+)
 from smp.sampling.feature_to_state import (
   NUM_EE,
   window_to_ee_trajectories,
@@ -45,6 +48,18 @@ class Cfg:
   """Compute device. Empty = auto."""
   fps: float = 50.0
   """Playback frame rate."""
+  style: str = ""
+  """Optional conditioned style name. Empty keeps unconditional sampling."""
+  style_upper: str = ""
+  """Upper-body style label for composed sampling."""
+  style_lower: str = ""
+  """Lower-body style label for composed sampling."""
+  cfg_scale: float = 1.0
+  """Classifier-free guidance scale for conditioned priors."""
+  sampler: str = "ddpm"
+  """Sampling algorithm: ``ddpm`` or ``ddim``."""
+  num_steps: int = 20
+  """Number of DDIM steps. Ignored when sampler=ddpm."""
 
 
 def _resolve_ckpt_path(cfg: Cfg) -> str:
@@ -75,27 +90,6 @@ def _resolve_ckpt_path(cfg: Cfg) -> str:
   return str(local)
 
 
-def _build_model_and_scheduler(
-  ckpt: dict, device: torch.device
-) -> tuple[DiffusionDenoiser, DDPMScheduler, np.ndarray, np.ndarray]:
-  cfg = ckpt["cfg"]
-  model = DiffusionDenoiser(
-    feature_dim=cfg["feature_dim"],
-    window_size=cfg["window_size"],
-    d_model=cfg.get("d_model", 256),
-    nhead=cfg.get("nhead", 8),
-    num_layers=cfg.get("num_layers", 2),
-    dropout=cfg.get("dropout", 0.0),
-  ).to(device)
-  state = ckpt.get("model_ema") or ckpt["model"]
-  model.load_state_dict(state)
-  model.eval()
-  scheduler = DDPMScheduler(
-    num_timesteps=cfg.get("num_timesteps", 50),
-  ).to(device)
-  return model, scheduler, ckpt["q_low"], ckpt["q_high"]
-
-
 def _setup_g1_sim(device: str):
   """Build a single G1 sim. Mirrors scripts/csv_to_npz.py:_setup_sim."""
   from mjlab.scene import Scene
@@ -111,33 +105,6 @@ def _setup_g1_sim(device: str):
   sim = Simulation(num_envs=1, cfg=sim_cfg, model=model, device=device)
   scene.initialize(sim.mj_model, sim.model, sim.data)
   return sim, scene
-
-
-def _quantile_denormalize(
-  x: torch.Tensor, q_low: torch.Tensor, q_high: torch.Tensor
-) -> torch.Tensor:
-  return denormalize_quantiles(x, q_low, q_high)
-
-
-@torch.no_grad()
-def _run_generate(
-  model: DiffusionDenoiser,
-  scheduler: DDPMScheduler,
-  q_low: np.ndarray,
-  q_high: np.ndarray,
-  window_size: int,
-  feature_dim: int,
-  device: torch.device,
-) -> torch.Tensor:
-  """Unconditional DDPM ancestral sampling. Returns (W, F) denormalized window on CPU."""
-  x_t = torch.randn(1, window_size, feature_dim, device=device)
-  for t in reversed(range(scheduler.num_timesteps)):
-    t_batch = torch.full((1,), t, dtype=torch.long, device=device)
-    eps = model(x_t, t_batch)
-    x_t = scheduler.step(eps, x_t, t)
-  q_low_t = torch.from_numpy(q_low).float().to(device)
-  q_high_t = torch.from_numpy(q_high).float().to(device)
-  return _quantile_denormalize(x_t.squeeze(0), q_low_t, q_high_t).cpu()
 
 
 def _write_pose_to_robot(
@@ -165,11 +132,40 @@ def main(cfg: Cfg) -> None:
 
   ckpt_path = _resolve_ckpt_path(cfg)
   ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-  model, scheduler, q_low, q_high = _build_model_and_scheduler(ckpt, device)
+  model, scheduler, q_low, q_high = build_model_and_scheduler(ckpt, device)
   print(f"Loaded checkpoint epoch={ckpt.get('epoch')} from {ckpt_path}")
 
   feature_dim = int(ckpt["cfg"]["feature_dim"])
   window_size = int(ckpt["cfg"]["window_size"])
+  style_names = tuple(ckpt["cfg"].get("style_names", ()))
+  style_id = None
+  style_upper_id = None
+  style_lower_id = None
+  has_composed_style = bool(cfg.style_upper) or bool(cfg.style_lower)
+  if cfg.style and has_composed_style:
+    msg = "Use either --style or both --style-upper/--style-lower, not both."
+    raise ValueError(msg)
+  if cfg.style:
+    if not style_names:
+      msg = "Checkpoint is unconditional; --style is not supported."
+      raise ValueError(msg)
+    style_id = resolve_style_label(style_names, cfg.style)
+    print(f"Sampling conditioned style '{cfg.style}' (id={style_id}), cfg_scale={cfg.cfg_scale}")
+  elif has_composed_style:
+    if not style_names:
+      msg = "Checkpoint is unconditional; composed style sampling is not supported."
+      raise ValueError(msg)
+    if not cfg.style_upper or not cfg.style_lower:
+      msg = "Composed sampling requires both --style-upper and --style-lower."
+      raise ValueError(msg)
+    style_upper_id = resolve_style_label(style_names, cfg.style_upper)
+    style_lower_id = resolve_style_label(style_names, cfg.style_lower)
+    print(
+      "Sampling composed style "
+      f"upper='{cfg.style_upper}' (id={style_upper_id}), "
+      f"lower='{cfg.style_lower}' (id={style_lower_id}), "
+      f"cfg_scale={cfg.cfg_scale}, sampler={cfg.sampler}"
+    )
 
   sim_device = device_str
   sim, scene = _setup_g1_sim(sim_device)
@@ -181,15 +177,35 @@ def main(cfg: Cfg) -> None:
   anchor_pelvis_quat = robot.data.default_root_state[0, 3:7].detach().cpu()
 
   def run() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    pred_denorm = _run_generate(
-      model,
-      scheduler,
-      q_low,
-      q_high,
-      window_size,
-      feature_dim,
-      device,
-    )
+    if style_upper_id is not None and style_lower_id is not None:
+      pred_denorm = sample_window_composed(
+        model,
+        scheduler,
+        q_low,
+        q_high,
+        window_size,
+        feature_dim,
+        device,
+        style_upper_id=style_upper_id,
+        style_lower_id=style_lower_id,
+        cfg_scale=cfg.cfg_scale,
+        sampler=cfg.sampler,
+        num_steps=cfg.num_steps if cfg.sampler.lower() == "ddim" else None,
+      )
+    else:
+      pred_denorm = sample_window(
+        model,
+        scheduler,
+        q_low,
+        q_high,
+        window_size,
+        feature_dim,
+        device,
+        style_id=style_id,
+        cfg_scale=cfg.cfg_scale,
+        sampler=cfg.sampler,
+        num_steps=cfg.num_steps if cfg.sampler.lower() == "ddim" else None,
+      )
     p_pos, p_quat, p_joint = window_to_pelvis_trajectory(
       pred_denorm,
       anchor_pelvis_pos,

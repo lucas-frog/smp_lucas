@@ -50,6 +50,7 @@ def _diffusion_loss(
   scheduler: DDPMScheduler,
   x_0: torch.Tensor,
   num_noise_samples: int,
+  class_labels: torch.Tensor | None = None,
 ) -> torch.Tensor:
   """DDPM ε-prediction L1 loss with multiple noise samples per data point.
 
@@ -61,10 +62,15 @@ def _diffusion_loss(
   K = num_noise_samples
   # (B, W, F) → (B*K, W, F)
   x_0_exp = x_0[:, None].expand(B, K, *x_0.shape[1:]).reshape(B * K, *x_0.shape[1:])
+  class_labels_exp = (
+    class_labels[:, None].expand(B, K).reshape(B * K)
+    if class_labels is not None
+    else None
+  )
   t = scheduler.sample_timesteps(B * K, x_0.device)
   noise = torch.randn_like(x_0_exp)
   x_t = scheduler.add_noise(x_0_exp, noise, t)
-  return F.l1_loss(model(x_t, t), noise)
+  return F.l1_loss(model(x_t, t, class_labels=class_labels_exp), noise)
 
 
 def _save_checkpoint(
@@ -86,6 +92,7 @@ def _save_checkpoint(
       **vars(cfg),
       "feature_dim": feature_dim,
       "window_size": dataset.window_size,
+      "style_names": dataset.style_names,
     },
   }
   if optimizer is not None:
@@ -131,6 +138,8 @@ def pretrain(cfg: PretrainCfg) -> Path:
     nhead=cfg.nhead,
     num_layers=cfg.num_layers,
     dropout=cfg.dropout,
+    num_classes=dataset.num_classes if cfg.conditional else 0,
+    cfg_dropout=cfg.cfg_dropout if cfg.conditional else 0.0,
   ).to(device)
   scheduler = DDPMScheduler(
     num_timesteps=cfg.num_timesteps,
@@ -149,11 +158,14 @@ def pretrain(cfg: PretrainCfg) -> Path:
   save_dir = Path(cfg.log_dir) / cfg.name / timestamp
   save_dir.mkdir(parents=True, exist_ok=True)
 
-  wandb_run = None
-  if cfg.use_wandb:
+  logger = None
+  _logger_type = cfg.logger
+  if cfg.logger == "wandb":
     import wandb
-
-    wandb_run = wandb.init(project=cfg.wandb_project, name=cfg.name, config=vars(cfg))
+    logger = wandb.init(project=cfg.wandb_project, name=cfg.name, config=vars(cfg))
+  elif cfg.logger == "tensorboard":
+    from torch.utils.tensorboard import SummaryWriter
+    logger = SummaryWriter(log_dir=str(save_dir))
 
   for epoch in range(cfg.num_epochs):
     model.train()
@@ -161,8 +173,14 @@ def pretrain(cfg: PretrainCfg) -> Path:
     n_batches = 0
 
     for batch in train_loader:
-      x_0 = batch.to(device, non_blocking=pin_memory)
-      loss = _diffusion_loss(model, scheduler, x_0, cfg.num_noise_samples)
+      x_0, class_labels = _move_batch_to_device(batch, device, pin_memory)
+      loss = _diffusion_loss(
+        model,
+        scheduler,
+        x_0,
+        cfg.num_noise_samples,
+        class_labels=class_labels,
+      )
 
       optimizer.zero_grad()
       loss.backward()
@@ -183,16 +201,20 @@ def pretrain(cfg: PretrainCfg) -> Path:
         eval_model, scheduler, val_loader, device, pin_memory, cfg.num_noise_samples
       )
       print(f"Epoch {epoch:4d} | train={avg_loss:.6f} | val={val_loss:.6f}")
-      if wandb_run is not None:
-        wandb_run.log({"epoch": epoch, "train/loss": avg_loss, "val/loss": val_loss})
+      if logger is not None:
+        if _logger_type == "tensorboard":
+          logger.add_scalar("train/loss", avg_loss, epoch)
+          logger.add_scalar("val/loss", val_loss, epoch)
+        else:
+          logger.log({"epoch": epoch, "train/loss": avg_loss, "val/loss": val_loss})
 
     if epoch % cfg.save_interval == 0 or epoch == cfg.num_epochs - 1:
       ckpt_path = save_dir / f"checkpoint_{epoch:05d}.pt"
       _save_checkpoint(
         ckpt_path, epoch, model, dataset, feature_dim, cfg, optimizer, ema
       )
-      if wandb_run is not None:
-        wandb_run.save(str(ckpt_path), base_path=str(save_dir))
+      if _logger_type == "wandb":
+        logger.save(str(ckpt_path), base_path=str(save_dir))
 
   final_path = save_dir / "pretrained.pt"
   _save_checkpoint(
@@ -200,9 +222,11 @@ def pretrain(cfg: PretrainCfg) -> Path:
   )
   print(f"Saved final checkpoint to {final_path}")
 
-  if wandb_run is not None:
-    wandb_run.save(str(final_path), base_path=str(save_dir))
-    wandb_run.finish()
+  if _logger_type == "wandb":
+    logger.save(str(final_path), base_path=str(save_dir))
+    logger.finish()
+  elif _logger_type == "tensorboard":
+    logger.close()
 
   return final_path
 
@@ -211,7 +235,7 @@ def pretrain(cfg: PretrainCfg) -> Path:
 def _validate(
   model: torch.nn.Module | DiffusionDenoiser,
   scheduler: DDPMScheduler,
-  val_loader: DataLoader[torch.Tensor],
+  val_loader: DataLoader[torch.Tensor | tuple[torch.Tensor, torch.Tensor]],
   device: torch.device,
   pin_memory: bool,
   num_noise_samples: int,
@@ -220,10 +244,30 @@ def _validate(
   total = torch.zeros((), device=device)
   n = 0
   for batch in val_loader:
-    x_0 = batch.to(device, non_blocking=pin_memory)
-    total += _diffusion_loss(model, scheduler, x_0, num_noise_samples)
+    x_0, class_labels = _move_batch_to_device(batch, device, pin_memory)
+    total += _diffusion_loss(
+      model,
+      scheduler,
+      x_0,
+      num_noise_samples,
+      class_labels=class_labels,
+    )
     n += 1
   return (total / max(n, 1)).item()
+
+
+def _move_batch_to_device(
+  batch: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+  device: torch.device,
+  pin_memory: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+  if isinstance(batch, (tuple, list)):
+    x_0, class_labels = batch
+    return (
+      x_0.to(device, non_blocking=pin_memory),
+      class_labels.to(device, non_blocking=pin_memory),
+    )
+  return batch.to(device, non_blocking=pin_memory), None
 
 
 if __name__ == "__main__":

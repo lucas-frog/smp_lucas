@@ -32,13 +32,14 @@ from mjlab.scene import Scene
 from mjlab.scripts.csv_to_npz import MotionLoader as CsvMotionLoader
 from mjlab.sim.sim import Simulation, SimulationCfg
 from mjlab.tasks.tracking.config.g1.env_cfgs import unitree_g1_flat_tracking_env_cfg
-
-from smp.motion.features import (
-  EE_BODY_NAMES,
-  NUM_EE,
-  NUM_JOINTS,
-  compute_motion_features,
+from mjlab.utils.lab_api.math import (
+  matrix_from_quat,
+  quat_apply_inverse,
+  quat_conjugate,
+  quat_mul,
+  yaw_quat,
 )
+
 from smp.utils import detect_device
 
 # Joint name order matches the CSV column order — the 29 G1 joints.
@@ -73,6 +74,20 @@ JOINT_NAMES: tuple[str, ...] = (
   "right_wrist_pitch_joint",
   "right_wrist_yaw_joint",
 )
+
+NUM_JOINTS = len(JOINT_NAMES)
+
+# Tracked end-effector bodies. ``torso_link`` proxies the head (head is
+# rigidly attached to the torso so the kinematic signal is the same).
+# Order must match the online RL feature buffer.
+EE_BODY_NAMES: tuple[str, ...] = (
+  "left_ankle_roll_link",
+  "right_ankle_roll_link",
+  "torso_link",
+  "left_wrist_yaw_link",
+  "right_wrist_yaw_link",
+)
+NUM_EE = len(EE_BODY_NAMES)
 
 
 @dataclass
@@ -173,6 +188,20 @@ def _fk_motion(
   )
 
 
+def _tan_norm_from_quat(quat: torch.Tensor) -> torch.Tensor:
+  """Convert quaternion (wxyz) to 6D tan-norm.
+
+  Stacks the rotation matrix's first column (rotated x-axis) and third
+  column (rotated z-axis).  This is the "tangent + normal" 6D
+  representation, NOT Zhou-2019's "first two columns" form.  Input
+  ``(..., 4)``, output ``(..., 6)`` as ``[col0_xyz, col2_xyz]``.
+  """
+  mat = matrix_from_quat(quat)
+  col0 = mat[..., :, 0]
+  col2 = mat[..., :, 2]
+  return torch.cat([col0, col2], dim=-1)
+
+
 def _compute_windows(
   base_pos: torch.Tensor,
   base_quat: torch.Tensor,
@@ -213,13 +242,50 @@ def _compute_windows(
   win_ee_pos = ee_pos.index_select(0, flat_idx).reshape(N, W, E, 3)
   win_joint = joint_pos.index_select(0, flat_idx).reshape(N, W, J)
 
-  return compute_motion_features(
-    root_pos=win_base_pos,
-    root_quat=win_base_quat,
-    root_lin_vel=win_base_lin_vel,
-    root_ang_vel=win_base_ang_vel,
-    ee_pos=win_ee_pos,
-    joint_pos=win_joint,
+  anchor_pos_T = win_base_pos[:, -1, :]
+  anchor_quat_T = win_base_quat[:, -1, :]
+  yaw_T = yaw_quat(anchor_quat_T)
+  heading_inv_T_WF = quat_conjugate(yaw_T)[:, None, :].expand(N, W, 4).reshape(-1, 4)
+  yaw_T_W = yaw_T[:, None, :].expand(N, W, 4).reshape(-1, 4)
+
+  # root_pos: xy in heading-inv frame, z in world.
+  root_offset = win_base_pos - anchor_pos_T[:, None, :]
+  root_pos_local = quat_apply_inverse(yaw_T_W, root_offset.reshape(-1, 3)).reshape(
+    N, W, 3
+  )
+  root_pos_local = root_pos_local.clone()
+  root_pos_local[..., 2] = win_base_pos[..., 2]
+
+  # root_rot: tan-norm of heading_inv(T) ⊗ root_quat[t].
+  root_rot_local_quat = quat_mul(
+    heading_inv_T_WF, win_base_quat.reshape(-1, 4)
+  ).reshape(N, W, 4)
+  root_rot_6d = _tan_norm_from_quat(root_rot_local_quat)
+
+  # EE: (ee[t] - root[t]) rotated into the last-frame heading-inv frame.
+  ee_offset_w = win_ee_pos - win_base_pos[:, :, None, :]
+  yaw_T_E = yaw_T[:, None, None, :].expand(N, W, E, 4).reshape(-1, 4)
+  ee_pos_local = quat_apply_inverse(yaw_T_E, ee_offset_w.reshape(-1, 3)).reshape(
+    N, W, E * 3
+  )
+
+  lin_vel_local = quat_apply_inverse(yaw_T_W, win_base_lin_vel.reshape(-1, 3)).reshape(
+    N, W, 3
+  )
+  ang_vel_local = quat_apply_inverse(yaw_T_W, win_base_ang_vel.reshape(-1, 3)).reshape(
+    N, W, 3
+  )
+
+  return torch.cat(
+    [
+      root_pos_local,
+      root_rot_6d,
+      win_joint,
+      ee_pos_local,
+      lin_vel_local,
+      ang_vel_local,
+    ],
+    dim=-1,
   )
 
 
