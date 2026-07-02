@@ -35,8 +35,37 @@ def g1_getup_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
   # --- Events --------------------------------------------------------------
   cfg.events["init_smp_state"].params["ckpt_path"] = (
-    "logs/pretrain/pretrain/20260614_142121/pretrained.pt"
+    "datasets/pretrain_ckpt/pretrained_getup_f2s2.pt"
   )
+  cfg.events.pop("gsi_reset", None)
+  cfg.events["mixed_pose_reset"] = EventTermCfg(
+    func=mdp.mixed_gsi_fallen_pose_reset,
+    mode="reset",
+    params={
+      "gsi_ratio": 0.2,
+      "fallen_pose_params": {
+        "root_height_range": (0.18, 0.24),
+        "xy_jitter": 0.15,
+        "tilt_noise": 0.12,
+        "joint_noise": 0.18,
+        "velocity_noise": 0.05,
+      },
+    },
+  )
+  # Fallen-only reset kept here for quick rollback:
+  # cfg.events.pop("gsi_reset", None)
+  # cfg.events.pop("gsi_refresh", None)
+  # cfg.events["fallen_pose_reset"] = EventTermCfg(
+  #   func=mdp.reset_real_fallen_poses,
+  #   mode="reset",
+  #   params={
+  #     "root_height_range": (0.12, 0.18),
+  #     "xy_jitter": 0.15,
+  #     "tilt_noise": 0.12,
+  #     "joint_noise": 0.18,
+  #     "velocity_noise": 0.05,
+  #   },
+  # )
   cfg.events["reset_stand_counter"] = EventTermCfg(
     func=mdp.reset_stand_counter, mode="reset"
   )
@@ -58,15 +87,24 @@ def g1_getup_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
           },
         ),
         (mdp.track_head_height, 0.3, {"target_height": 1.1, "scale": 1.0}),
+        (
+            mdp.action_rate_l2,
+            -0.05,
+            {
+              "head_height_threshold": 0.9,
+              "low_height_scale": 0.5,
+              "high_height_scale": 1.0,
+            },
+        ),
       ),
     },
   )
 
   # --- Terminations --------------------------------------------------------
-  cfg.terminations.pop("self_collision", None)
+  # cfg.terminations.pop("self_collision", None)
   cfg.terminations["smp_too_low"] = TerminationTermCfg(
     func=mdp.smp_too_low,
-    params={"threshold": 0.02, "ws": 6.0, "grace_steps": 5},
+    params={"threshold": 0.02, "ws": 6.0, "grace_steps": 60},
   )
 
   cfg.terminations["stood_up"] = TerminationTermCfg(

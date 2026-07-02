@@ -134,7 +134,7 @@ def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       interval_range_s=(5.0, 6.0),
       params={
         "velocity_range": {
-          "x": (-0.8, 0.8),
+          "x": (-0.5, 0.5),
           "y": (-0.5, 0.5),
           "z": (-0.4, 0.4),
           "roll": (-0.52, 0.52),
@@ -151,7 +151,7 @@ def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
           "robot", geom_names=r"^(left|right)_foot[1-7]_collision$"
         ),
         "operation": "abs",
-        "ranges": (0.3, 1.6),
+        "ranges": (0.3, 1.2),
         "shared_random": True,  # All foot geoms share the same friction.
       },
     ),
@@ -170,9 +170,9 @@ def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         "asset_cfg": SceneEntityCfg("robot", body_names="torso_link"),
         "operation": "add",
         "ranges": {
-          0: (-0.05, 0.05),
-          1: (-0.05, 0.05),
-          2: (-0.05, 0.05),
+          0: (-0.025, 0.025),
+          1: (-0.025, 0.025),
+          2: (-0.03, 0.03),
         },
       },
     ),

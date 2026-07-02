@@ -9,9 +9,39 @@ import torch
 from mjlab.envs import ManagerBasedRlEnv
 
 __all__ = [
+  "action_rate_l2",
   "track_head_height",
   "upward_velocity",
 ]
+
+
+def _head_height(env: ManagerBasedRlEnv) -> torch.Tensor:
+  robot = env.scene["robot"]
+  head_idx = robot.find_sites(["head"], preserve_order=True)[0][0]
+  return robot.data.site_pos_w[:, head_idx, 2]
+
+
+def action_rate_l2(
+  env: ManagerBasedRlEnv,
+  head_height_threshold: float = 0.9,
+  low_height_scale: float = 0.2,
+  high_height_scale: float = 1.0,
+) -> torch.Tensor:
+  """Penalize action changes with separate low/high head-height scales.
+
+  The low-height scale keeps crouched/low-head jitter from being free while
+  still allowing faster action changes during recovery than in upright tracking.
+  """
+  action_rate = torch.sum(
+    torch.square(env.action_manager.action - env.action_manager.prev_action), dim=1
+  )
+  head_z = _head_height(env)
+  scale = torch.where(
+    head_z >= head_height_threshold,
+    torch.full_like(action_rate, high_height_scale),
+    torch.full_like(action_rate, low_height_scale),
+  )
+  return action_rate * scale
 
 
 def track_head_height(
@@ -22,9 +52,7 @@ def track_head_height(
   """Reward the ``head`` site reaching ``target_height``:
   ``exp(-scale·max(target_height − head_z, 0)²)`` (no penalty for overshoot).
   Needs the ``head`` site from ``getup_env_cfg.get_g1_spec_with_head``."""
-  robot = env.scene["robot"]
-  head_idx = robot.find_sites(["head"], preserve_order=True)[0][0]
-  z = robot.data.site_pos_w[:, head_idx, 2]
+  z = _head_height(env)
   shortfall = torch.clamp(z - target_height, max=0.0)
   return torch.exp(-scale * shortfall * shortfall)
 
