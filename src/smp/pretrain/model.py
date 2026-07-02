@@ -40,18 +40,72 @@ class _TimestepEmbedding(nn.Module):
     return self.linear_2(self.act(self.linear_1(x)))
 
 
+class _LabelEmbedding(nn.Module):
+  def __init__(self, num_classes: int, hidden_size: int, dropout_prob: float) -> None:
+    super().__init__()
+    use_cfg_embedding = dropout_prob > 0.0
+    self.embedding_table = nn.Embedding(
+      num_classes + int(use_cfg_embedding), hidden_size
+    )
+    self.num_classes = num_classes
+    self.dropout_prob = dropout_prob
+
+  def _token_drop(
+    self,
+    labels: torch.Tensor,
+    force_drop_ids: torch.Tensor | None = None,
+  ) -> torch.Tensor:
+    if force_drop_ids is None:
+      drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
+    else:
+      drop_ids = force_drop_ids.to(device=labels.device, dtype=torch.bool)
+    return torch.where(drop_ids, self.num_classes, labels)
+
+  def forward(
+    self,
+    labels: torch.Tensor,
+    force_drop_ids: torch.Tensor | None = None,
+  ) -> torch.Tensor:
+    use_dropout = self.dropout_prob > 0.0
+    if (self.training and use_dropout) or (force_drop_ids is not None):
+      labels = self._token_drop(labels, force_drop_ids)
+    return self.embedding_table(labels)
+
+
 class _AdaLayerNormSingle(nn.Module):
   """PixArt-α adaLN-single: produce (B, 1, 6·D) timestep modulation."""
 
-  def __init__(self, embedding_dim: int) -> None:
+  def __init__(
+    self,
+    embedding_dim: int,
+    num_classes: int = 0,
+    cfg_dropout: float = 0.0,
+  ) -> None:
     super().__init__()
     self.time_proj = _Timesteps(num_channels=256)
     self.timestep_embedder = _TimestepEmbedding(256, embedding_dim)
+    self.num_classes = num_classes
+    self.label_embedder = (
+      _LabelEmbedding(num_classes, embedding_dim, cfg_dropout)
+      if num_classes > 0
+      else None
+    )
     self.silu = nn.SiLU()
     self.linear = nn.Linear(embedding_dim, 6 * embedding_dim, bias=True)
 
-  def forward(self, t: torch.Tensor) -> torch.Tensor:
-    t_emb = self.timestep_embedder(self.time_proj(t)).unsqueeze(1)
+  def forward(
+    self,
+    t: torch.Tensor,
+    class_labels: torch.Tensor | None = None,
+    force_drop_ids: torch.Tensor | None = None,
+  ) -> torch.Tensor:
+    t_emb = self.timestep_embedder(self.time_proj(t))
+    if self.label_embedder is not None:
+      if class_labels is None:
+        msg = "class_labels must be provided when num_classes > 0"
+        raise ValueError(msg)
+      t_emb = t_emb + self.label_embedder(class_labels, force_drop_ids=force_drop_ids)
+    t_emb = t_emb.unsqueeze(1)
     return self.linear(self.silu(t_emb))
 
 
@@ -179,10 +233,14 @@ class DiffusionDenoiser(nn.Module):
     num_layers: int = 2,
     dropout: float = 0.0,
     head_dim: int | None = None,
+    num_classes: int = 0,
+    cfg_dropout: float = 0.0,
   ) -> None:
     super().__init__()
     self.feature_dim = feature_dim
     self.window_size = window_size
+    self.num_classes = num_classes
+    self.cfg_dropout = cfg_dropout
 
     if head_dim is None:
       if d_model % nhead != 0:
@@ -204,7 +262,11 @@ class DiffusionDenoiser(nn.Module):
 
     self.preprocess_conv = nn.Conv1d(feature_dim, feature_dim, 1, bias=False)
     self.proj_in = nn.Linear(feature_dim, self.inner_dim, bias=False)
-    self.adaln_single = _AdaLayerNormSingle(self.inner_dim)
+    self.adaln_single = _AdaLayerNormSingle(
+      self.inner_dim,
+      num_classes=num_classes,
+      cfg_dropout=cfg_dropout,
+    )
     self.sequence_pos_encoder = _SinusoidalPositionalEmbedding(
       self.inner_dim, max_seq_length=max(window_size, 32)
     )
@@ -222,13 +284,23 @@ class DiffusionDenoiser(nn.Module):
     self.proj_out = nn.Linear(self.inner_dim, feature_dim, bias=False)
     self.postprocess_conv = nn.Conv1d(feature_dim, feature_dim, 1, bias=False)
 
-  def forward(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+  def forward(
+    self,
+    x_t: torch.Tensor,
+    t: torch.Tensor,
+    class_labels: torch.Tensor | None = None,
+    force_drop_ids: torch.Tensor | None = None,
+  ) -> torch.Tensor:
     h = x_t.transpose(1, 2)
     h = self.preprocess_conv(h) + h
     h = h.transpose(1, 2)
 
     h = self.proj_in(h)
-    time_hidden_states = self.adaln_single(t)
+    time_hidden_states = self.adaln_single(
+      t,
+      class_labels=class_labels,
+      force_drop_ids=force_drop_ids,
+    )
     h = self.sequence_pos_encoder(h)
 
     for block in self.blocks:
