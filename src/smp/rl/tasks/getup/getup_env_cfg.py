@@ -101,7 +101,7 @@ def g1_getup_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   )
 
   # --- Terminations --------------------------------------------------------
-  # cfg.terminations.pop("self_collision", None)
+  cfg.terminations.pop("self_collision", None)
   cfg.terminations["smp_too_low"] = TerminationTermCfg(
     func=mdp.smp_too_low,
     params={"threshold": 0.02, "ws": 6.0, "grace_steps": 60},

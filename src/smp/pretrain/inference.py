@@ -8,7 +8,11 @@ import numpy as np
 import torch
 
 from smp.pretrain.feature_masks import build_upper_lower_feature_masks
-from smp.pretrain.model import DiffusionDenoiser
+from smp.pretrain.model import (
+  DiffusionDenoiser,
+  build_denoiser,
+  resolve_denoiser_arch_name,
+)
 from smp.pretrain.scheduler import DDPMScheduler
 
 
@@ -139,15 +143,22 @@ def build_model_and_scheduler(
 ) -> tuple[DiffusionDenoiser, DDPMScheduler, np.ndarray, np.ndarray]:
   cfg = ckpt["cfg"]
   style_names = tuple(cfg.get("style_names", ()))
-  model = DiffusionDenoiser(
+  conditional = bool(cfg.get("conditional", False))
+  arch_name = resolve_denoiser_arch_name(
+    cfg.get("arch_name", ""),
+    conditional=conditional,
+  )
+  num_classes = int(cfg.get("num_classes", len(style_names)))
+  model = build_denoiser(
+    arch_name=arch_name,
     feature_dim=int(cfg["feature_dim"]),
     window_size=int(cfg["window_size"]),
     d_model=int(cfg.get("d_model", 256)),
     nhead=int(cfg.get("nhead", 8)),
     num_layers=int(cfg.get("num_layers", 2)),
     dropout=float(cfg.get("dropout", 0.0)),
-    num_classes=len(style_names) if bool(cfg.get("conditional", False)) else 0,
-    cfg_dropout=float(cfg.get("cfg_dropout", 0.0)),
+    num_classes=num_classes if arch_name == "CondDiT" else 0,
+    cfg_dropout=float(cfg.get("cfg_dropout", 0.0)) if arch_name == "CondDiT" else 0.0,
   ).to(device)
   state = ckpt.get("model_ema") or ckpt["model"]
   model.load_state_dict(state)

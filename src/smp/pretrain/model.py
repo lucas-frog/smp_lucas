@@ -9,6 +9,27 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def resolve_denoiser_arch_name(
+  arch_name: str | None,
+  *,
+  conditional: bool = False,
+) -> str:
+  """Return the canonical denoiser architecture name.
+
+  MimicKit names the class-conditioned architecture ``CondDiT``.  ``cdit`` is
+  accepted as a short CLI-friendly alias.
+  """
+  arch = (arch_name or "").replace("_", "").replace("-", "").lower()
+  if not arch:
+    return "CondDiT" if conditional else "DiT"
+  if arch == "dit":
+    return "CondDiT" if conditional else "DiT"
+  if arch in {"cdit", "conddit", "conditionaldit"}:
+    return "CondDiT"
+  msg = f"Unknown denoiser architecture '{arch_name}'. Expected 'DiT' or 'CondDiT'."
+  raise ValueError(msg)
+
+
 class _Timesteps(nn.Module):
   """Sinusoidal timestep features, ``flip_sin_to_cos`` (cos first, sin second)."""
 
@@ -310,3 +331,77 @@ class DiffusionDenoiser(nn.Module):
     h = h.transpose(1, 2)
     h = self.postprocess_conv(h) + h
     return h.transpose(1, 2)
+
+
+class CondDiffusionDenoiser(DiffusionDenoiser):
+  """Class-conditioned DiT matching MimicKit's ``CondTinyStableMotionDiTModel``.
+
+  The conditioning path is the same adaLN-single label pathway used by MimicKit:
+  class label embeddings are added to the timestep embedding, optionally with an
+  extra unconditional label for classifier-free guidance dropout.
+  """
+
+  def __init__(
+    self,
+    feature_dim: int,
+    window_size: int,
+    d_model: int = 256,
+    nhead: int = 4,
+    num_layers: int = 2,
+    dropout: float = 0.0,
+    head_dim: int | None = None,
+    num_classes: int = 0,
+    cfg_dropout: float = 0.0,
+  ) -> None:
+    if num_classes <= 0:
+      msg = f"CondDiT requires num_classes > 0, got {num_classes}."
+      raise ValueError(msg)
+    super().__init__(
+      feature_dim=feature_dim,
+      window_size=window_size,
+      d_model=d_model,
+      nhead=nhead,
+      num_layers=num_layers,
+      dropout=dropout,
+      head_dim=head_dim,
+      num_classes=num_classes,
+      cfg_dropout=cfg_dropout,
+    )
+
+
+def build_denoiser(
+  arch_name: str | None,
+  *,
+  feature_dim: int,
+  window_size: int,
+  d_model: int = 256,
+  nhead: int = 4,
+  num_layers: int = 2,
+  dropout: float = 0.0,
+  head_dim: int | None = None,
+  num_classes: int = 0,
+  cfg_dropout: float = 0.0,
+) -> DiffusionDenoiser:
+  """Build a motion diffusion denoiser from a canonical or MimicKit arch name."""
+  arch_name = resolve_denoiser_arch_name(arch_name)
+  if arch_name == "CondDiT":
+    return CondDiffusionDenoiser(
+      feature_dim=feature_dim,
+      window_size=window_size,
+      d_model=d_model,
+      nhead=nhead,
+      num_layers=num_layers,
+      dropout=dropout,
+      head_dim=head_dim,
+      num_classes=num_classes,
+      cfg_dropout=cfg_dropout,
+    )
+  return DiffusionDenoiser(
+    feature_dim=feature_dim,
+    window_size=window_size,
+    d_model=d_model,
+    nhead=nhead,
+    num_layers=num_layers,
+    dropout=dropout,
+    head_dim=head_dim,
+  )

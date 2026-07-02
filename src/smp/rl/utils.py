@@ -11,7 +11,11 @@ import torch
 from smp.motion.features import compute_motion_features
 from smp.motion.normalization import denormalize_quantiles
 from smp.pretrain.feature_masks import build_upper_lower_feature_masks
-from smp.pretrain.model import DiffusionDenoiser
+from smp.pretrain.model import (
+  DiffusionDenoiser,
+  build_denoiser,
+  resolve_denoiser_arch_name,
+)
 from smp.pretrain.scheduler import DDPMScheduler
 
 
@@ -45,6 +49,8 @@ def _remap_tinymdm_to_denoiser(state_dict: dict[str, Any]) -> dict[str, Any]:
 
     # adaln_single.emb.  →  adaln_single.  (drop ".emb" sub-module)
     new_key = new_key.replace("adaln_single.emb.", "adaln_single.")
+    # CondTinyStableMotionDiTModel names the label embedder class_embedder.
+    new_key = new_key.replace("adaln_single.class_embedder.", "adaln_single.label_embedder.")
 
     # to_out.0.bias — DiffusionDenoiser uses bias=False → skip
     if "to_out.0.bias" in new_key:
@@ -103,6 +109,7 @@ def load_denoiser(
     cfg: dict[str, Any] = {
       "feature_dim": feature_dim,
       "window_size": window_size,
+      "arch_name": "DiT",
       "d_model": d_model,
       "nhead": 4,
       "num_layers": num_layers,
@@ -139,17 +146,24 @@ def load_denoiser(
   feature_dim = int(cfg["feature_dim"])
   window_size = int(cfg["window_size"])
   conditional = bool(cfg.get("conditional", False))
+  arch_name = resolve_denoiser_arch_name(
+    cfg.get("arch_name", ""),
+    conditional=conditional,
+  )
+  conditional = arch_name == "CondDiT"
   style_names = tuple(cfg.get("style_names", ()))
+  num_classes = int(cfg.get("num_classes", len(style_names)))
 
-  model = DiffusionDenoiser(
+  model = build_denoiser(
+    arch_name=arch_name,
     feature_dim=feature_dim,
     window_size=window_size,
     d_model=int(cfg.get("d_model", 256)),
     nhead=int(cfg.get("nhead", 8)),
     num_layers=int(cfg.get("num_layers", 2)),
     dropout=float(cfg.get("dropout", 0.0)),
-    num_classes=len(style_names) if conditional else 0,
-    cfg_dropout=float(cfg.get("cfg_dropout", 0.0)) if conditional else 0.0,
+    num_classes=num_classes if arch_name == "CondDiT" else 0,
+    cfg_dropout=float(cfg.get("cfg_dropout", 0.0)) if arch_name == "CondDiT" else 0.0,
   ).to(device)
   model.load_state_dict(state, strict=False)
   model.eval()
@@ -345,7 +359,6 @@ def sample_prior_windows(
   device: torch.device,
 ) -> torch.Tensor:
   """Sample denormalized motion windows from the configured prior bundle."""
-  model: DiffusionDenoiser = bundle["model"]
   scheduler: DDPMScheduler = bundle["scheduler"]
   q_low: torch.Tensor = bundle["q_low"]
   q_high: torch.Tensor = bundle["q_high"]

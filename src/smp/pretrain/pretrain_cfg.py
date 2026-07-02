@@ -19,6 +19,8 @@ class PretrainCfg:
 
   # Model. ``d_model = nhead · head_dim`` is the DiT inner dim; FF inner
   # dim is fixed at 4·d_model.
+  arch_name: str = "DiT"
+  """Denoiser architecture: 'DiT' or MimicKit-compatible 'CondDiT'/'cdit'."""
   d_model: int = 256
   nhead: int = 4
   num_layers: int = 2

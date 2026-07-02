@@ -13,7 +13,11 @@ import tyro
 from torch.utils.data import DataLoader, random_split
 
 from smp.pretrain.dataset import MotionWindowDataset
-from smp.pretrain.model import DiffusionDenoiser
+from smp.pretrain.model import (
+  DiffusionDenoiser,
+  build_denoiser,
+  resolve_denoiser_arch_name,
+)
 from smp.pretrain.pretrain_cfg import PretrainCfg
 from smp.pretrain.scheduler import DDPMScheduler
 from smp.utils import count_parameters, seed_everything
@@ -90,8 +94,10 @@ def _save_checkpoint(
     "q_high": dataset.q_high,
     "cfg": {
       **vars(cfg),
+      "arch_name": cfg.arch_name,
       "feature_dim": feature_dim,
       "window_size": dataset.window_size,
+      "num_classes": dataset.num_classes,
       "style_names": dataset.style_names,
     },
   }
@@ -100,6 +106,23 @@ def _save_checkpoint(
   if ema is not None:
     data["model_ema"] = ema.shadow.state_dict()
   torch.save(data, path)
+
+
+def _resolve_pretrain_arch(cfg: PretrainCfg, dataset: MotionWindowDataset) -> str:
+  arch_name = resolve_denoiser_arch_name(
+    cfg.arch_name,
+    conditional=cfg.conditional,
+  )
+  if arch_name == "CondDiT":
+    if not dataset.is_conditioned or dataset.num_classes <= 0:
+      msg = (
+        "CondDiT training requires class-conditioned data laid out as "
+        "style subdirectories under data_dir."
+      )
+      raise ValueError(msg)
+    cfg.conditional = True
+  cfg.arch_name = arch_name
+  return arch_name
 
 
 def pretrain(cfg: PretrainCfg) -> Path:
@@ -111,6 +134,7 @@ def pretrain(cfg: PretrainCfg) -> Path:
   dataset = MotionWindowDataset(cfg.data_dir, norm_stats_file=cfg.norm_stats_file)
   feature_dim = dataset.feature_dim
   window_size = dataset.window_size
+  arch_name = _resolve_pretrain_arch(cfg, dataset)
 
   n_train = int(len(dataset) * cfg.train_split)
   n_val = len(dataset) - n_train
@@ -131,7 +155,8 @@ def pretrain(cfg: PretrainCfg) -> Path:
     val_set, batch_size=cfg.batch_size, shuffle=False, pin_memory=pin_memory
   )
 
-  model = DiffusionDenoiser(
+  model = build_denoiser(
+    arch_name=arch_name,
     feature_dim=feature_dim,
     window_size=window_size,
     d_model=cfg.d_model,
