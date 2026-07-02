@@ -8,14 +8,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.entity import Entity
-from mjlab.sensor import BuiltinSensor, ContactSensor
+from mjlab.managers.scene_entity_config import SceneEntityCfg
+from mjlab.sensor import ContactSensor
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
-
-  from smp.rl.tasks.steering.mdp.commands import SteeringCommand
 
 
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
@@ -205,11 +203,136 @@ def feet_gait(
             reward *= scale
     return reward
 
-def action_rate_l2(env: ManagerBasedRlEnv) -> torch.Tensor:
-  """Penalize the rate of change of the actions using L2 squared kernel.
 
-  Operates on raw policy output (before per-term scale/offset).
+def _head_height(env: ManagerBasedRlEnv) -> torch.Tensor:
+  robot = env.scene["robot"]
+  head_idx = robot.find_sites(["head"], preserve_order=True)[0][0]
+  return robot.data.site_pos_w[:, head_idx, 2]
+
+def action_rate_l2(
+  env: ManagerBasedRlEnv,
+  head_height_threshold: float = 0.9,
+  low_height_scale: float = 0.2,
+  high_height_scale: float = 1.0,
+) -> torch.Tensor:
+  """Penalize action changes with separate low/high head-height scales.
+
+  The low-height scale keeps crouched/low-head jitter from being free while
+  still allowing faster action changes during recovery than in upright tracking.
   """
-  return torch.sum(
+  action_rate = torch.sum(
     torch.square(env.action_manager.action - env.action_manager.prev_action), dim=1
   )
+  head_z = _head_height(env)
+  scale = torch.where(
+    head_z >= head_height_threshold,
+    torch.full_like(action_rate, high_height_scale),
+    torch.full_like(action_rate, low_height_scale),
+  )
+  return action_rate * scale
+
+def track_head_height(
+  env: ManagerBasedRlEnv,
+  target_height: float = 1.2,
+  scale: float = 6.0,
+) -> torch.Tensor:
+  """Reward the ``head`` site reaching ``target_height``:
+  ``exp(-scale·max(target_height − head_z, 0)²)`` (no penalty for overshoot).
+  Needs the ``head`` site from ``getup_env_cfg.get_g1_spec_with_head``."""
+  z = _head_height(env)
+  shortfall = torch.clamp(z - target_height, max=0.0)
+  return torch.exp(-scale * shortfall * shortfall)
+
+
+# 鼓励“头部”以目标速度向上运动；而当头部高度达到一定阈值后，停止施加这个速度要求
+def upward_velocity(
+  env: ManagerBasedRlEnv,
+  target_velocity: float = 0.25,
+  head_height_threshold: float = 0.6,
+  scale: float = 100.0,
+) -> torch.Tensor:
+  """Reward upward HEAD velocity below ``head_height_threshold`` (else ``1``):
+  ``exp(-scale·max(target_velocity − head_vz, 0)²)``.  Uses the head site's world
+  velocity (``site_lin_vel_w``, includes ω×r from torso pitch) so it drives the
+  head, not the pelvis.  Needs ``getup_env_cfg.get_g1_spec_with_head``."""
+  robot = env.scene["robot"]
+  head_idx = robot.find_sites(["head"], preserve_order=True)[0][0]
+  head_z = robot.data.site_pos_w[:, head_idx, 2]
+  head_vz = robot.data.site_lin_vel_w[:, head_idx, 2]
+  shortfall = torch.clamp(head_vz - target_velocity, max=0.0)
+  shaped = torch.exp(-scale * shortfall * shortfall)
+  return torch.where(
+    head_z < head_height_threshold,
+    shaped,
+    torch.ones_like(shaped),
+  )
+
+
+def upward_velocity_when_low(
+  env: ManagerBasedRlEnv,
+  target_velocity: float = 0.25,
+  head_height_threshold: float = 0.6,
+  scale: float = 100.0,
+  upright_threshold: float = 0.9,
+) -> torch.Tensor:
+  """``upward_velocity`` gated: zeroed when head ≥ ``upright_threshold``.
+
+  The original ``upward_velocity`` logic (including its internal
+  ``head_height_threshold`` gating that returns 1 above threshold) is
+  preserved.  Above ``upright_threshold`` the reward is zeroed so it
+  yields to velocity-tracking terms.
+  """
+  reward = upward_velocity(env, target_velocity, head_height_threshold, scale)
+  head_z = _head_height(env)
+  return torch.where(head_z < upright_threshold, reward, torch.zeros_like(reward))
+
+
+def track_linear_velocity_upright(
+  env: ManagerBasedRlEnv,
+  std: float,
+  command_name: str,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+  reverse_penalty: bool = False,
+  head_height_threshold: float = 0.9,
+) -> torch.Tensor:
+  """``track_linear_velocity`` gated: active only when head ≥ threshold.
+
+  Below the threshold this returns zero so the policy focuses on getting up
+  rather than tracking velocity commands it cannot satisfy yet.
+  """
+  reward = track_linear_velocity(env, std, command_name, asset_cfg, reverse_penalty)
+  head_z = _head_height(env)
+  return torch.where(head_z >= head_height_threshold, reward, torch.zeros_like(reward))
+
+
+def track_angular_velocity_upright(
+  env: ManagerBasedRlEnv,
+  std: float,
+  command_name: str,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+  head_height_threshold: float = 0.9,
+) -> torch.Tensor:
+  """``track_angular_velocity`` gated: active only when head ≥ threshold.
+
+  Below the threshold this returns zero so the policy focuses on getting up
+  rather than tracking angular velocity commands.
+  """
+  reward = track_angular_velocity(env, std, command_name, asset_cfg)
+  head_z = _head_height(env)
+  return torch.where(head_z >= head_height_threshold, reward, torch.zeros_like(reward))
+
+
+def track_head_height_when_low(
+  env: ManagerBasedRlEnv,
+  target_height: float = 1.2,
+  scale: float = 6.0,
+  head_height_threshold: float = 0.9,
+) -> torch.Tensor:
+  """``track_head_height`` gated: active only when head **<** threshold.
+
+  Above the threshold the robot is already upright — the height reward
+  is no longer needed and yields to the velocity-tracking terms.
+  """
+  reward = track_head_height(env, target_height, scale)
+  head_z = _head_height(env)
+  return torch.where(head_z < head_height_threshold, reward, torch.zeros_like(reward))
