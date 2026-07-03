@@ -92,9 +92,14 @@ def g1_getup_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             -0.05,
             {
               "head_height_threshold": 0.9,
-              "low_height_scale": 0.5,
+              "low_height_scale": 1.5,
               "high_height_scale": 1.0,
             },
+        ),
+        (
+            mdp.joint_pos_limits,
+            -10.0,
+            {},
         ),
       ),
     },

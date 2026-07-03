@@ -6,13 +6,18 @@ Combined and SMP-gated via the generic ``smp.rl.rewards.smp_product``.
 from __future__ import annotations
 
 import torch
+from mjlab.entity import Entity
 from mjlab.envs import ManagerBasedRlEnv
+from mjlab.managers.scene_entity_config import SceneEntityCfg
 
 __all__ = [
   "action_rate_l2",
+  "joint_pos_limits",
   "track_head_height",
   "upward_velocity",
 ]
+
+_DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 
 
 def _head_height(env: ManagerBasedRlEnv) -> torch.Tensor:
@@ -79,3 +84,21 @@ def upward_velocity(
     shaped,
     torch.ones_like(shaped),
   )
+
+
+def joint_pos_limits(
+  env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG
+) -> torch.Tensor:
+  """Penalize joint positions if they cross the soft limits."""
+  asset: Entity = env.scene[asset_cfg.name]
+  soft_joint_pos_limits = asset.data.soft_joint_pos_limits
+  assert soft_joint_pos_limits is not None
+  out_of_limits = -(
+    asset.data.joint_pos[:, asset_cfg.joint_ids]
+    - soft_joint_pos_limits[:, asset_cfg.joint_ids, 0]
+  ).clip(max=0.0)
+  out_of_limits += (
+    asset.data.joint_pos[:, asset_cfg.joint_ids]
+    - soft_joint_pos_limits[:, asset_cfg.joint_ids, 1]
+  ).clip(min=0.0)
+  return torch.sum(out_of_limits, dim=1)

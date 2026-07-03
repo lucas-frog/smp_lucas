@@ -1,7 +1,6 @@
 """Velocity-tracking reward components for the localization task.
 
-These terms can be combined with SMP guidance through
-``smp.rl.rewards.combined_reward``.
+All terms are SMP-gated via the generic ``smp.rl.rewards.task_smp_product``.
 """
 
 from __future__ import annotations
@@ -11,8 +10,7 @@ from typing import TYPE_CHECKING
 import torch
 from mjlab.entity import Entity
 from mjlab.managers.scene_entity_config import SceneEntityCfg
-from mjlab.sensor import ContactSensor, BuiltinSensor
-from mjlab.utils.lab_api.string import resolve_matching_names_values
+from mjlab.sensor import ContactSensor
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
@@ -135,23 +133,6 @@ def track_angular_velocity(
   ang_vel_error = z_error + xy_error
   return torch.exp(-ang_vel_error / std**2)
 
-
-def body_ang_vel(
-  env: ManagerBasedRlEnv,
-  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
-) -> torch.Tensor:
-  """Penalize torso roll/pitch angular velocity to suppress flailing motion."""
-  asset: Entity = env.scene[asset_cfg.name]
-  body_ids = asset_cfg.body_ids
-  if isinstance(body_ids, slice) and asset_cfg.body_names is not None:
-    body_ids, _ = asset.find_bodies(
-      asset_cfg.body_names,
-      preserve_order=asset_cfg.preserve_order,
-    )
-  ang_vel = asset.data.body_link_ang_vel_w[:, body_ids, :]
-  ang_vel_xy = ang_vel[..., :2]
-  return torch.sum(torch.square(ang_vel_xy), dim=(-1, -2))
-
 def stand_still(
         env: ManagerBasedRlEnv,
         command_name: str,
@@ -223,140 +204,16 @@ def feet_gait(
     return reward
 
 
-def _ensure_variable_posture_cache(
-  env: ManagerBasedRlEnv,
-  asset_cfg: SceneEntityCfg,
-  std_standing: dict[str, float],
-  std_walking: dict[str, float],
-  std_running: dict[str, float],
-) -> dict:
-  """Lazily resolve joint names/IDs and per-regime std tensors.
-
-  Stores the result on ``env._variable_posture_cache`` so subsequent calls
-  are a single hasattr check.  The cache dict contains:
-
-  - ``"default_joint_pos"``: (1, num_selected_joints)
-  - ``"joint_ids"``: list[int] of resolved joint indices
-  - ``"std_standing"``, ``"std_walking"``, ``"std_running"``:
-    each (num_selected_joints,) float32 tensor
-  """
-  cache_key = "_variable_posture_cache"
-  if hasattr(env, cache_key):
-    return getattr(env, cache_key)
-
-  asset: Entity = env.scene[asset_cfg.name]
-
-  # Resolve joint names + ids from the name pattern (e.g. ".*").
-  joint_ids, joint_names = asset.find_joints(asset_cfg.joint_names)
-
-  def _resolve_std(data: dict[str, float]) -> torch.Tensor:
-    _, _, values = resolve_matching_names_values(
-      data=data, list_of_strings=joint_names,
-    )
-    return torch.tensor(values, device=env.device, dtype=torch.float32)
-
-  cache = {
-    "default_joint_pos": asset.data.default_joint_pos,
-    "joint_ids": joint_ids,
-    "std_standing": _resolve_std(std_standing),
-    "std_walking": _resolve_std(std_walking),
-    "std_running": _resolve_std(std_running),
-  }
-  setattr(env, cache_key, cache)
-  return cache
-
-
-def variable_posture(
-  env: ManagerBasedRlEnv,
-  std_standing: dict[str, float],
-  std_walking: dict[str, float],
-  std_running: dict[str, float],
-  asset_cfg: SceneEntityCfg,
-  command_name: str,
-  walking_threshold: float = 0.1,
-  running_threshold: float = 1.5,
-) -> torch.Tensor:
-  """Posture reward with speed-dependent per-joint tolerance.
-
-  Three regimes are blended smoothly based on the total command magnitude
-  ``|lin_xy| + |ang_z|``:
-
-  - **standing**  (total < *walking_threshold*): tight tolerance — joints
-    must stay close to ``default_joint_pos``.
-  - **walking**   (*walking_threshold* <= total < *running_threshold*):
-    moderate freedom for natural gait deformation.
-  - **running**   (total >= *running_threshold*): loose tolerance for
-    large-amplitude motion.
-
-  For each joint the per-step reward is
-  ``exp(-mean((current_pos - default_pos)^2 / std^2))``
-  where ``std`` is the blended per-joint value from the three regime dicts.
-
-  ``std_standing``, ``std_walking``, ``std_running`` are dicts mapping
-  joint-name regex patterns (e.g. ``r".*knee.*"``) to float std values.
-  Every joint must match exactly one pattern per dict.
-  """
-  cache = _ensure_variable_posture_cache(
-    env, asset_cfg, std_standing, std_walking, std_running,
-  )
-
-  asset: Entity = env.scene[asset_cfg.name]
-  command = env.command_manager.get_command(command_name)
-  assert command is not None, f"Command '{command_name}' not found."
-
-  # Per-environment speed regime via total command magnitude.
-  linear_speed = torch.norm(command[:, :2], dim=1)
-  angular_speed = torch.abs(command[:, 2])
-  total_speed = linear_speed + angular_speed
-
-  standing_mask = (total_speed < walking_threshold).float()
-  walking_mask = (
-    (total_speed >= walking_threshold) & (total_speed < running_threshold)
-  ).float()
-  running_mask = (total_speed >= running_threshold).float()
-
-  # Blend per-joint std tensors: (B, 1) * (J,) -> (B, J).
-  std = (
-    cache["std_standing"] * standing_mask.unsqueeze(1)
-    + cache["std_walking"] * walking_mask.unsqueeze(1)
-    + cache["std_running"] * running_mask.unsqueeze(1)
-  )
-
-  # Index into current and default joint positions using cached ids.
-  joint_ids = cache["joint_ids"]
-  current_joint_pos = asset.data.joint_pos[:, joint_ids]
-  desired_joint_pos = cache["default_joint_pos"][:, joint_ids]
-  error_sq = torch.square(current_joint_pos - desired_joint_pos)
-
-  return torch.exp(-torch.mean(error_sq / (std ** 2), dim=1))
-
-
 def _head_height(env: ManagerBasedRlEnv) -> torch.Tensor:
   robot = env.scene["robot"]
   head_idx = robot.find_sites(["head"], preserve_order=True)[0][0]
   return robot.data.site_pos_w[:, head_idx, 2]
 
-def action_rate_l2(
-  env: ManagerBasedRlEnv,
-  head_height_threshold: float = 0.9,
-  low_height_scale: float = 0.2,
-  high_height_scale: float = 1.0,
-) -> torch.Tensor:
-  """Penalize action changes with separate low/high head-height scales.
-
-  The low-height scale keeps crouched/low-head jitter from being free while
-  still allowing faster action changes during recovery than in upright tracking.
-  """
-  action_rate = torch.sum(
+def action_rate_l2(env: ManagerBasedRlEnv) -> torch.Tensor:
+  """Penalize action changes (L2 norm of action difference)."""
+  return torch.sum(
     torch.square(env.action_manager.action - env.action_manager.prev_action), dim=1
   )
-  head_z = _head_height(env)
-  scale = torch.where(
-    head_z >= head_height_threshold,
-    torch.full_like(action_rate, high_height_scale),
-    torch.full_like(action_rate, low_height_scale),
-  )
-  return action_rate * scale
 
 def track_head_height(
   env: ManagerBasedRlEnv,
