@@ -237,9 +237,10 @@ def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     name="self_collision",
     primary=ContactMatch(mode="subtree", pattern="pelvis", entity="robot"),
     secondary=ContactMatch(mode="subtree", pattern="pelvis", entity="robot"),
-    fields=("found",),
+    fields=("found", "force"),
     reduce="none",
     num_slots=1,
+    history_length=4,
   )
 
   # --- Terminations --------------------------------------------------------
