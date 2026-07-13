@@ -24,7 +24,7 @@ dev = [
 ]
 
 [tool.uv.sources]
-mjlab = { git = "https://github.com/mujocolab/mjlab.git", rev = "731fa27" }
+mjlab = { git = "https://github.com/lucas-frog/mjlab.git", rev = "30ce2425" }
 
 [tool.pyright]
 pythonVersion = "3.13"
