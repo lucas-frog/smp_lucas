@@ -5,6 +5,8 @@ from __future__ import annotations
 import torch
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.managers.scene_entity_config import SceneEntityCfg
+from mjlab.tasks.velocity.mdp import illegal_contact
+from mjlab.utils.lab_api.math import quat_apply_inverse
 
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 
@@ -20,6 +22,33 @@ def root_height_below_minimum(
   below_minimum = asset.data.root_link_pos_w[:, 2] < minimum_height
   past_grace = env.episode_length_buf >= grace_steps
   return below_minimum & past_grace
+
+
+def velocity_only_root_height_below_minimum(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  minimum_height: float,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+  grace_steps: int = 15,
+) -> torch.Tensor:
+  """Apply root-height termination only to recovery velocity environments."""
+  command = env.command_manager.get_term(command_name)
+  return root_height_below_minimum(
+    env,
+    minimum_height=minimum_height,
+    asset_cfg=asset_cfg,
+    grace_steps=grace_steps,
+  ) & command.is_velocity_env
+
+
+def velocity_only_illegal_contact(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  sensor_name: str,
+) -> torch.Tensor:
+  """Apply self-collision termination only to recovery velocity environments."""
+  command = env.command_manager.get_term(command_name)
+  return illegal_contact(env, sensor_name=sensor_name) & command.is_velocity_env
 
 # 脱离了合理的运动空间，就立即强制结束当前的训练回合
 def smp_too_low(
@@ -80,3 +109,69 @@ def stood_up(
   env._localization_stand_count = cnt  # type: ignore[attr-defined]
   env._localization_was_below_stand_height = was_below  # type: ignore[attr-defined]
   return was_below & (cnt >= hold_steps)
+
+def bad_motion_body_pos_z_only(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  threshold: float,
+  body_names: tuple[str, ...] | None = None,
+  grace_steps: int = 15,
+) -> torch.Tensor:
+  command = env.command_manager.get_term(command_name)
+  body_indexes = _tracking_body_indexes(command.trajectory, body_names)
+  error = torch.abs(
+    command.trajectory.body_pos_w[:, body_indexes, -1]
+    - command.trajectory.robot_body_pos_w[:, body_indexes, -1]
+  )
+  bad = torch.any(error > threshold, dim=-1)
+  past_grace = env.episode_length_buf >= grace_steps
+  return bad & command.is_trajectory_env & past_grace
+
+def bad_anchor_pos_z_only(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  threshold: float,
+  grace_steps: int = 15,
+) -> torch.Tensor:
+  command = env.command_manager.get_term(command_name)
+  bad = (
+    torch.abs(
+      command.trajectory.anchor_pos_w[:, -1]
+      - command.trajectory.robot_anchor_pos_w[:, -1]
+    )
+    > threshold
+  )
+  past_grace = env.episode_length_buf >= grace_steps
+  return bad & command.is_trajectory_env & past_grace
+
+def bad_anchor_ori(
+  env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg, command_name: str, threshold: float
+) -> torch.Tensor:
+  asset = env.scene[asset_cfg.name]
+  command = env.command_manager.get_term(command_name)
+  gravity = asset.data.gravity_vec_w
+  if gravity.ndim == 1:
+    gravity = gravity.unsqueeze(0).expand_as(command.trajectory.anchor_pos_w)
+  motion_projected_gravity_b = quat_apply_inverse(
+    command.trajectory.anchor_quat_w, gravity
+  )
+
+  robot_projected_gravity_b = quat_apply_inverse(
+    command.trajectory.robot_anchor_quat_w, gravity
+  )
+
+  bad = (
+    motion_projected_gravity_b[:, 2] - robot_projected_gravity_b[:, 2]
+  ).abs() > threshold
+  return bad & command.is_trajectory_env
+
+
+def _tracking_body_indexes(
+  trajectory_command,
+  body_names: tuple[str, ...] | None,
+) -> list[int]:
+  return [
+    i
+    for i, name in enumerate(trajectory_command.cfg.body_names)
+    if body_names is None or name in body_names
+  ]
